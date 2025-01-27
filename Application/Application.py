@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk , messagebox
+from tkinter import messagebox
 from PIL import Image, ImageTk
 import os
 import cv2
@@ -16,20 +16,30 @@ class ImageApp:
         self.end_x = None
         self.end_y = None
         self.rect_id = None
-        self.mode = tk.StringVar(value="Add")  
-        self.current_image = None  
-        self.rectangles = [] 
-        self.image_index = 0 
-        self.image_list = [] 
+        self.mode = tk.StringVar(value="Add")
+        self.current_image = None
+        self.rectangles = []
+        self.image_index = 0
+        self.image_list = []
         self.image_dirs = "data"
         self.neut_coords_dir = "coordinates"
+        self.state_file = "state/app_state.txt"
 
+
+        os.makedirs("processed", exist_ok=True)
+        os.makedirs("final", exist_ok=True)
+        os.makedirs("state", exist_ok=True)
+
+        # Load the image list
         self.image_list = [img for img in os.listdir(self.image_dirs) if img.endswith(('.png', '.jpg', '.jpeg'))]
 
         if not self.image_list:
             raise FileNotFoundError(f"No images found in the image directory.")
 
+        # Load the saved state (if it exists)
+        self.load_state()
 
+        # GUI Elements
         self.image_label = tk.Label(root)
         self.image_label.pack(pady=10)
 
@@ -38,48 +48,76 @@ class ImageApp:
         self.continue_button.pack(side=tk.LEFT, padx=5)
         self.regenerate_button.pack(side=tk.RIGHT, padx=5)
 
+        # Load the current image
         self.load_image()
 
+        # Save the state when the app is closed
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def load_state(self):
+        """Load the saved state (image_index) from the state file."""
+        if os.path.exists(self.state_file):
+            with open(self.state_file, "r") as file:
+                self.image_index = int(file.read().strip())
+                # Ensure the index is within bounds
+                if self.image_index >= len(self.image_list):
+                    self.image_index = 0
+
+    def save_state(self):
+        """Save the current state (image_index) to the state file."""
+        with open(self.state_file, "w") as file:
+            file.write(str(self.image_index))
+
+    def on_close(self):
+        """Save the state and close the application."""
+        self.save_state()
+        self.root.quit()
+
     def load_image(self):
+        """Load the current image and its coordinates."""
         self.current_image_path = self.image_list[self.image_index]
-        self.rectangles = self.load_coordinates(self.current_image_path)  
+        self.rectangles = self.load_coordinates(self.current_image_path)
         self.display_image(f"{self.image_dirs}/{self.current_image_path}")
 
     def load_next_image(self):
+        """Load the next image in the list."""
         self.image_index += 1
 
         if self.image_index >= len(self.image_list):
             messagebox.showinfo("All Done", "All images have been processed. The application will now exit.")
-            self.root.quit()  
+            self.root.quit()
             return
 
         self.load_image()
 
-
     def display_image(self, image_path):
+        """Display the image in the GUI."""
         image = Image.open(image_path)
-        image = image.resize((1280, 512)) 
+        image = image.resize((1280, 512))
         self.image_tk = ImageTk.PhotoImage(image)
         self.image_label.config(image=self.image_tk)
 
     def on_continue(self):
+        """Process the current image."""
         self.process_image()
 
     def calculate_score(self, area, circularity, white_percentage):
-        area_score = min(max((area - 100) / (1000 - 100), 0), 1) 
-        circularity_score = min(max((circularity - 0.48) / (1 - 0.48), 0), 1) 
-        white_percentage_score = min(max((white_percentage - 0.05) / (1 - 0.05), 0), 1)  
+        """Calculate a score based on area, circularity, and white percentage."""
+        area_score = min(max((area - 100) / (1000 - 100), 0), 1)
+        circularity_score = min(max((circularity - 0.48) / (1 - 0.48), 0), 1)
+        white_percentage_score = min(max((white_percentage - 0.05) / (1 - 0.05), 0), 1)
 
         score = 0.15 * area_score + 0.7 * circularity_score + 0.15 * white_percentage_score
         return score
-    
+
     def process_image(self):
+        """Process the image to detect contours and calculate scores."""
         file_name = os.path.abspath(os.path.join(self.image_dirs, self.current_image_path))
         img_name = os.path.basename(self.current_image_path)
         out_dir = os.path.join("processed", img_name)
 
         tile = cv2.imread(file_name)
-        image_intact = tile.copy()  
+        image_intact = tile.copy()
 
         tile[tile > 220] = 255
         gray_tile = cv2.cvtColor(tile, cv2.COLOR_BGR2GRAY)
@@ -123,7 +161,6 @@ class ImageApp:
                 neighborhood = cv2.bitwise_and(thresh, thresh, mask=neighborhood_mask)
 
                 total_pixels = cv2.countNonZero(neighborhood_mask)
-                # white_pixels = cv2.countNonZero(neighborhood)
                 light_areas_mask = cv2.inRange(tile, (200, 200, 200), (255, 255, 255))
 
                 neighborhood_light = cv2.bitwise_and(light_areas_mask, light_areas_mask, mask=neighborhood_mask)
@@ -145,7 +182,7 @@ class ImageApp:
                 text_position = (x, y - 10)
                 cv2.putText(tile, score_text, text_position, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
 
-                self.rectangles.append((x, y, x + w, y + h, color))  
+                self.rectangles.append((x, y, x + w, y + h, color))
 
         self.update_coordinates_file()
 
@@ -155,8 +192,8 @@ class ImageApp:
         self.display_image(out_dir)
         self.show_post_processing_options()
 
-
     def update_coordinates_file(self):
+        """Update the coordinates file with the current rectangles."""
         output_file = f"{self.neut_coords_dir}/{os.path.splitext(self.current_image_path)[0]}_coords.txt"
         os.makedirs(self.neut_coords_dir, exist_ok=True)
 
@@ -165,18 +202,14 @@ class ImageApp:
                 x1, y1, x2, y2, color = rect
                 file.write(f"{x1},{y1},{x2},{y2},{color[0]},{color[1]},{color[2]}\n")
 
-
     def save_rectangle(self, x1, y1, x2, y2):
-        color = (0, 255, 0) 
-
+        """Save a rectangle to the list."""
+        color = (0, 255, 0)
         self.rectangles.append((x1, y1, x2, y2, color))
-
         self.update_coordinates_file()
 
-
-  
-
     def remove_rectangle(self, x, y):
+        """Remove a rectangle from the list."""
         canvas_width = 1280
         canvas_height = 512
         image = cv2.imread(f"processed/{self.current_image_path}")
@@ -189,7 +222,7 @@ class ImageApp:
         scaled_y = int(y * scale_y)
 
         for rect in self.rectangles:
-            x1, y1, x2, y2, score = rect
+            x1, y1, x2, y2, _ = rect
             if x1 <= scaled_x <= x2 and y1 <= scaled_y <= y2:
                 self.rectangles.remove(rect)
                 self.update_coordinates_file()
@@ -197,11 +230,11 @@ class ImageApp:
 
                 line_thickness = 2
                 line_length = 10
-                color = (0, 0, 255) 
-                cv2.line(image, (scaled_x - line_length, scaled_y - line_length), 
-                        (scaled_x + line_length, scaled_y + line_length), color, thickness=line_thickness)
-                cv2.line(image, (scaled_x - line_length, scaled_y + line_length), 
-                        (scaled_x + line_length, scaled_y - line_length), color, thickness=line_thickness)
+                color = (0, 0, 255)
+                cv2.line(image, (scaled_x - line_length, scaled_y - line_length),
+                         (scaled_x + line_length, scaled_y + line_length), color, thickness=line_thickness)
+                cv2.line(image, (scaled_x - line_length, scaled_y + line_length),
+                         (scaled_x + line_length, scaled_y - line_length), color, thickness=line_thickness)
 
                 updated_image_path = f"processed/{self.current_image_path}"
                 cv2.imwrite(updated_image_path, image)
@@ -213,23 +246,10 @@ class ImageApp:
                 messagebox.showinfo("Rectangle Removed", f"Removed rectangle: {rect}")
                 return
 
-
-
-        updated_image_path = f"processed/{self.current_image_path}"
-        cv2.imwrite(updated_image_path, image)
-
-        updated_image = Image.open(updated_image_path).resize((1280, 512))
-        self.image_tk_edit = ImageTk.PhotoImage(updated_image)
-        self.edit_canvas.itemconfig(self.canvas_image, image=self.image_tk_edit)
-
         messagebox.showinfo("No Match", "No rectangle found at the clicked location.")
 
-
-
-
-
-
     def show_post_processing_options(self):
+        """Show options after processing the image."""
         for widget in self.root.pack_slaves():
             if isinstance(widget, tk.Button):
                 widget.destroy()
@@ -240,6 +260,7 @@ class ImageApp:
         self.edit_button.pack(side=tk.RIGHT, padx=5)
 
     def on_save(self):
+        """Save the processed image and remove it from the list."""
         final_image_path = f"final/{self.current_image_path}"
         os.makedirs("final", exist_ok=True)
 
@@ -251,12 +272,19 @@ class ImageApp:
         with open("image_data.txt", "a") as file:
             file.write(f"Processed and saved image: {self.current_image_path}\n")
 
+        # Remove the saved image from the list
+        self.image_list.pop(self.image_index)
+        if self.image_index >= len(self.image_list):
+            self.image_index = 0
+
         self.reset_to_initial_page()
 
     def on_edit(self):
+        """Enter edit mode."""
         self.enter_edit_mode()
 
     def enter_edit_mode(self):
+        """Enter edit mode for the current image."""
         for widget in self.root.pack_slaves():
             widget.destroy()
 
@@ -271,7 +299,7 @@ class ImageApp:
         self.edit_canvas.pack()
 
         processed_image_path = f"processed/{self.current_image_path}"
-        self.current_image = cv2.imread(processed_image_path) 
+        self.current_image = cv2.imread(processed_image_path)
         self.image_tk_edit = ImageTk.PhotoImage(Image.open(processed_image_path).resize((1280, 512)))
         self.canvas_image = self.edit_canvas.create_image(0, 0, anchor=tk.NW, image=self.image_tk_edit)
 
@@ -283,6 +311,7 @@ class ImageApp:
         self.finalize_button.pack(side=tk.RIGHT, padx=5)
 
     def on_drag_start(self, event):
+        """Handle the start of dragging."""
         if self.mode.get() == "Add":
             self.start_x, self.start_y = event.x, event.y
             self.rect_id = None
@@ -291,6 +320,7 @@ class ImageApp:
             self.remove_rectangle(x, y)
 
     def on_drag_move(self, event):
+        """Handle dragging motion."""
         if self.mode.get() == "Add":
             if self.rect_id:
                 self.edit_canvas.delete(self.rect_id)
@@ -300,6 +330,7 @@ class ImageApp:
             )
 
     def on_drag_end(self, event):
+        """Handle the end of dragging."""
         if self.mode.get() == "Add":
             canvas_width = 1280
             canvas_height = 512
@@ -317,15 +348,13 @@ class ImageApp:
             for rect in self.rectangles:
                 x1, y1, x2, y2, _ = rect
                 if x1 == scaled_start_x and y1 == scaled_start_y and x2 == scaled_end_x and y2 == scaled_end_y:
-                    return 
-
+                    return
 
             self.save_rectangle(scaled_start_x, scaled_start_y, scaled_end_x, scaled_end_y)
             self.redraw_image()
 
-
-
     def redraw_image(self):
+        """Redraw the image with the current rectangles."""
         base_image_path = f"processed/{self.current_image_path}"
         image = cv2.imread(base_image_path)
 
@@ -339,15 +368,15 @@ class ImageApp:
         self.image_tk_edit = ImageTk.PhotoImage(updated_image)
         self.edit_canvas.itemconfig(self.canvas_image, image=self.image_tk_edit)
 
-
-
     def update_mode(self):
+        """Update the mode (Add/Remove)."""
         if self.mode.get() == "Add":
             self.edit_canvas.config(cursor="arrow")
         elif self.mode.get() == "Remove":
             self.edit_canvas.config(cursor="crosshair")
 
     def save_final_image(self):
+        """Save the final image and reset the UI."""
         final_image_path = f"final/{self.current_image_path}"
         os.makedirs("final", exist_ok=True)
         cv2.imwrite(final_image_path, self.current_image)
@@ -355,6 +384,7 @@ class ImageApp:
         self.reset_to_initial_page()
 
     def reset_to_initial_page(self):
+        """Reset the UI to the initial state."""
         for widget in self.root.pack_slaves():
             widget.destroy()
         self.image_label = tk.Label(self.root)
@@ -366,6 +396,7 @@ class ImageApp:
         self.regenerate_button.pack(side=tk.RIGHT, padx=5)
 
     def load_coordinates(self, image_name):
+        """Load coordinates from the coordinates file."""
         coord_file = f"{self.neut_coords_dir}/{os.path.splitext(image_name)[0]}_coords.txt"
         rectangles = []
         if os.path.exists(coord_file):
@@ -373,9 +404,8 @@ class ImageApp:
                 for line in file:
                     x1, y1, x2, y2, r, g, b = map(int, line.strip().split(","))
                     color = (r, g, b)
-                    rectangles.append((x1, y1, x2, y2, color)) 
+                    rectangles.append((x1, y1, x2, y2, color))
         return rectangles
-
 
 
 if __name__ == "__main__":

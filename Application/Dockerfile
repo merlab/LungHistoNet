@@ -11,5 +11,6 @@ COPY . /app
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-CMD ["python", "Application.py"]
+RUN mkdir -p /app/processed /app/final
 
+CMD ["python", "Application.py"]

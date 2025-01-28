@@ -27,7 +27,7 @@ LungHistoNet is a deep learning project that utilizes Vision Transformers to ana
    Follow the instructions to log in (ensure you verify your email to log in successfully).
 3. Pull the application by running the following command:
    ```bash
-   docker pull amirhosseinebrahimi/lung-injury
+   docker pull amirhosseinebrahimi/lung-injury:latset_v4
    ```
 
 ### Step 4: Install Brew
@@ -56,13 +56,38 @@ LungHistoNet is a deep learning project that utilizes Vision Transformers to ana
 
 ### Step 7: Set Up Display for the Application
 1. Open Terminal and set up the display (leave the Terminal open after pressing Enter):
+   
+-  MacOS
    ```bash
    socat TCP-LISTEN:6000,reuseaddr,fork UNIX-CLIENT:"$DISPLAY"
    ```
-2. Open another Terminal and run the following command (replace `XXX` with your laptop username):
+-  Linux (debian)
    ```bash
-   docker run -it --rm  -e DISPLAY=host.docker.internal:0 \
-   -v /Users/XXX/Desktop/LungInjury/Tiles:/app/data \
-   -v /Users/XXX/Desktop/LungInjury/Coordinates:/app/coordinates \
-   amirhosseinebrahimi/lung-injury
+   sudo xhost +local:docker
+   ````
+2. Open another Terminal and run the following command (replace `XXX` with your laptop username):
+   
+- MacOS
+
+   ```bash
+   docker run -it --rm -e DISPLAY=host.docker.internal:0 \
+   -v /Users/XXX/Desktop/LungInjury/Tile2/ALI_Study4_Jun_2022_Mouse_8:/app/data \
+   -v /Users/XXX/Desktop/LungInjury/Coordinates/ALI_Study4_Jun_2022_Mouse_8:/app/coordinates \
+   -v /Users/XXX/Desktop/LungInjury/State:/app/state \
+   -v /Users/XXX/Desktop/LungInjury/Processed:/app/processed -v \
+   amirhosseinebrahimi/lung-injury  
+   ```
+
+-  Linux (debian)
+   ```BASH
+   sudo docker run -it --rm   -e DISPLAY=$DISPLAY  \
+   -v /tmp/.X11-unix:/tmp/.X11-unix   \
+   -v /home/XXX/Desktop/Lung_Injury/Tiles/1:/app/data  \
+   -v /home/XXX/Desktop/Lung_Injury/Coordinates/1:/app/coordinates  \
+   -v /home/XXX/Desktop/Lung_Injury/State:/app/state \
+   -v /home/XXX/Desktop/Lung_Injury/Processed:/app/processed  \
+   -v /home/XXX/Desktop/Lung_Injury/Final:/app/final  \
+   amirhosseinebrahimi/lung-injury:latest_v4
+
+   ```
    

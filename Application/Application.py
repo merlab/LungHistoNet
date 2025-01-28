@@ -30,16 +30,13 @@ class ImageApp:
         os.makedirs("final", exist_ok=True)
         os.makedirs("state", exist_ok=True)
 
-        # Load the image list
         self.image_list = [img for img in os.listdir(self.image_dirs) if img.endswith(('.png', '.jpg', '.jpeg'))]
 
         if not self.image_list:
             raise FileNotFoundError(f"No images found in the image directory.")
 
-        # Load the saved state (if it exists)
         self.load_state()
 
-        # GUI Elements
         self.image_label = tk.Label(root)
         self.image_label.pack(pady=10)
 
@@ -48,10 +45,8 @@ class ImageApp:
         self.continue_button.pack(side=tk.LEFT, padx=5)
         self.regenerate_button.pack(side=tk.RIGHT, padx=5)
 
-        # Load the current image
         self.load_image()
 
-        # Save the state when the app is closed
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def load_state(self):
@@ -59,7 +54,6 @@ class ImageApp:
         if os.path.exists(self.state_file):
             with open(self.state_file, "r") as file:
                 self.image_index = int(file.read().strip())
-                # Ensure the index is within bounds
                 if self.image_index >= len(self.image_list):
                     self.image_index = 0
 
@@ -272,7 +266,6 @@ class ImageApp:
         with open("image_data.txt", "a") as file:
             file.write(f"Processed and saved image: {self.current_image_path}\n")
 
-        # Remove the saved image from the list
         self.image_list.pop(self.image_index)
         if self.image_index >= len(self.image_list):
             self.image_index = 0

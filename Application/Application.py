@@ -30,13 +30,16 @@ class ImageApp:
         os.makedirs("final", exist_ok=True)
         os.makedirs("state", exist_ok=True)
 
+        # Load the image list
         self.image_list = [img for img in os.listdir(self.image_dirs) if img.endswith(('.png', '.jpg', '.jpeg'))]
 
         if not self.image_list:
             raise FileNotFoundError(f"No images found in the image directory.")
 
+        # Load the saved state (if it exists)
         self.load_state()
 
+        # GUI Elements
         self.image_label = tk.Label(root)
         self.image_label.pack(pady=10)
 
@@ -45,8 +48,10 @@ class ImageApp:
         self.continue_button.pack(side=tk.LEFT, padx=5)
         self.regenerate_button.pack(side=tk.RIGHT, padx=5)
 
+        # Load the current image
         self.load_image()
 
+        # Save the state when the app is closed
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def load_state(self):
@@ -54,6 +59,7 @@ class ImageApp:
         if os.path.exists(self.state_file):
             with open(self.state_file, "r") as file:
                 self.image_index = int(file.read().strip())
+                # Ensure the index is within bounds
                 if self.image_index >= len(self.image_list):
                     self.image_index = 0
 
@@ -237,10 +243,10 @@ class ImageApp:
                 self.image_tk_edit = ImageTk.PhotoImage(updated_image)
                 self.edit_canvas.itemconfig(self.canvas_image, image=self.image_tk_edit)
 
-                messagebox.showinfo("Rectangle Removed", f"Removed rectangle: {rect}")
+                # messagebox.showinfo("Rectangle Removed", f"Removed rectangle: {rect}")
                 return
 
-        messagebox.showinfo("No Match", "No rectangle found at the clicked location.")
+        # messagebox.showinfo("No Match", "No rectangle found at the clicked location.")
 
     def show_post_processing_options(self):
         """Show options after processing the image."""
@@ -266,6 +272,7 @@ class ImageApp:
         with open("image_data.txt", "a") as file:
             file.write(f"Processed and saved image: {self.current_image_path}\n")
 
+        # Remove the saved image from the list
         self.image_list.pop(self.image_index)
         if self.image_index >= len(self.image_list):
             self.image_index = 0
@@ -280,6 +287,11 @@ class ImageApp:
         """Enter edit mode for the current image."""
         for widget in self.root.pack_slaves():
             widget.destroy()
+
+        self.mode_label_name = tk.Entry(self.root, width=50)
+        self.mode_label_name.insert(0, f"{self.current_image_path}")
+        self.mode_label_name.config(state='readonly')
+        self.mode_label_name.pack()
 
         self.mode_label = tk.Label(self.root, text="Mode:")
         self.mode_label.pack()

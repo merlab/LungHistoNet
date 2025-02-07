@@ -27,7 +27,7 @@ LungHistoNet is a deep learning project that utilizes Vision Transformers to ana
    Follow the instructions to log in (ensure you verify your email to log in successfully).
 3. Pull the application by running the following command:
    ```bash
-   docker pull amirhosseinebrahimi/lung-injury:latset_v4
+   docker pull amirhosseinebrahimi/lung-injury:latset_v5
    ```
 
 ### Step 4: Install Brew
@@ -75,7 +75,7 @@ LungHistoNet is a deep learning project that utilizes Vision Transformers to ana
    -v /Users/XXX/Desktop/LungInjury/Coordinates/ALI_Study4_Jun_2022_Mouse_8:/app/coordinates \
    -v /Users/XXX/Desktop/LungInjury/State:/app/state \
    -v /Users/XXX/Desktop/LungInjury/Processed:/app/processed -v \
-   amirhosseinebrahimi/lung-injury  
+   amirhosseinebrahimi/lung-injury:latset_v5
    ```
 
 -  Linux (debian)
@@ -87,7 +87,7 @@ LungHistoNet is a deep learning project that utilizes Vision Transformers to ana
    -v /home/XXX/Desktop/Lung_Injury/State:/app/state \
    -v /home/XXX/Desktop/Lung_Injury/Processed:/app/processed  \
    -v /home/XXX/Desktop/Lung_Injury/Final:/app/final  \
-   amirhosseinebrahimi/lung-injury:latest_v4
+   amirhosseinebrahimi/lung-injury:latest_v5
 
    ```
    

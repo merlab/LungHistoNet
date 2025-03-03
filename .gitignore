@@ -1,6 +1,10 @@
 Yolo/runs/
-
+Yolo/test/
+Yolo/Data/
 Yolo/yolov8*.pt
+Yolo/*.zip
+Yolo/*.pt
+
 
 Eval/healthy/*.png
 Eval/images/*.png

@@ -6,6 +6,7 @@ observer2_dir = "labels_O2/Healthy/"
 intersection_dir = "Intersection_Labels/Healthy"
 union_dir = "Union_Labels/Healthy"
 
+# print(os.listdir(observer1_dir))
 # os.makedirs(intersection_dir, exist_ok=True)
 # os.makedirs(union_dir, exist_ok=True)
 
@@ -125,8 +126,5 @@ for prefix in common_prefixes:
         for box in union_boxes:
             yolo_box = to_yolo_format(box)
             f.write(f"{yolo_box[0]} {yolo_box[1]} {yolo_box[2]} {yolo_box[3]} {yolo_box[4]}\n")
+            print(".")
 
-    print(f"Processed {prefix}: Intersection={len(intersection_boxes)} boxes, Union={len(union_boxes)} boxes")
-
-print(f"Intersection labels saved to {intersection_dir}")
-print(f"Union labels saved to {union_dir}")

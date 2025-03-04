@@ -1,13 +1,13 @@
 import os
 import csv
 
-observer1_dir = "Observer_1_Temporary_Test/"
-observer2_dir = "Observer_2_Temporary_Test/"
-intersection_dir = "Intersection_Labels/"
-union_dir = "Union_Labels/"
+observer1_dir = "labels_O1/Healthy/"
+observer2_dir = "labels_O2/Healthy/"
+intersection_dir = "Intersection_Labels/Healthy"
+union_dir = "Union_Labels/Healthy"
 
-os.makedirs(intersection_dir, exist_ok=True)
-os.makedirs(union_dir, exist_ok=True)
+# os.makedirs(intersection_dir, exist_ok=True)
+# os.makedirs(union_dir, exist_ok=True)
 
 def calculate_iou(box1, box2):
     x1_1, y1_1, x2_1, y2_1 = box1

@@ -4,6 +4,7 @@ Yolo/Data/
 Yolo/yolov8*.pt
 Yolo/*.zip
 Yolo/*.pt
+Yolo/*.png
 
 
 Eval/healthy/*.png

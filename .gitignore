@@ -15,3 +15,7 @@ Eval/labels_O1/
 Eval/Union_Labels/
 Eval/models/*.pt
 Eval/out/*
+
+Application/coords
+Application/*.json
+Application/tet.ipynb

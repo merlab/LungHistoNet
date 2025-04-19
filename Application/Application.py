@@ -12,6 +12,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 from googleapiclient.http import MediaIoBaseDownload
 from googleapiclient.discovery import build
 import json
+import shutil
 
 
 class CloudImageApp:
@@ -134,29 +135,33 @@ class CloudImageApp:
             self.update_coordinates_file()
             
             final_path = os.path.join(self.final_dir, self.current_image_info['name'])
+            
+            # Use processed image if available, otherwise use original
             processed_path = os.path.join(self.processed_dir, self.current_image_info['name'])
+            if not os.path.exists(processed_path):
+                processed_path = os.path.join(self.temp_dir, self.current_image_info['name'])
             
             if os.path.exists(processed_path):
                 image = cv2.imread(processed_path)
                 
+                # Draw all rectangles
                 for rect in self.rectangles:
                     x1, y1, x2, y2, class_name = rect
                     color = self.feature_colors.get(class_name, (0, 255, 0))
                     cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
                     cv2.putText(image, class_name, (x1, y1-10), 
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
                 
                 cv2.imwrite(final_path, image)
                 print(f"Saved final image with {len(self.rectangles)} rectangles: {final_path}")
                 self.image_processed = True
                 
-                # messagebox.showinfo("Success", "Edits saved locally. Click 'Next Image' to upload to cloud.")
                 self.clear_edit_widgets()
                 self.setup_initial_ui()
-                self.display_image(processed_path)  # Redisplay current image without resetting rectangles
+                self.display_image(final_path)  # Redisplay saved image
             else:
-                print(f"Processed image not found: {processed_path}")
-                messagebox.showerror("Error", "No processed image found. Please process the image first.")
+                print(f"Source image not found: {processed_path}")
+                messagebox.showerror("Error", "No source image found.")
                 
         except Exception as e:
             print(f"Failed to save edited image: {str(e)}")
@@ -570,17 +575,50 @@ class CloudImageApp:
 
 
     def process_hyaline_membranes(self):
-        """Placeholder for Hyaline Membranes processing."""
-        messagebox.showinfo("Info", "Hyaline Membranes processing will be implemented soon")
-        self.display_image(self.current_image_path)
-        self.show_post_processing_options()
+        """Prepare for Hyaline Membranes editing."""
+        try:
+            # Just copy the original image to processed directory
+            original_path = os.path.join(self.temp_dir, self.current_image_info['name'])
+            processed_path = os.path.join(self.processed_dir, self.current_image_info['name'])
+            
+            if os.path.exists(original_path):
+                import shutil
+                shutil.copy2(original_path, processed_path)
+                
+                # Set the current feature
+                self.current_feature = "Hyaline Membranes"
+                
+                # Display the image
+                self.display_image(processed_path)
+                self.show_post_processing_options()
+            else:
+                messagebox.showerror("Error", "Original image not found")
+                
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to prepare for editing: {str(e)}")
 
     def process_proteinaceous_debris(self):
-        """Placeholder for Proteinaceous Debris processing."""
-        messagebox.showinfo("Info", "Proteinaceous Debris processing will be implemented soon")
-        self.display_image(self.current_image_path)
-        self.show_post_processing_options()
-
+            """Prepare for Proteinaceous Debris editing."""
+            try:
+                # Just copy the original image to processed directory
+                original_path = os.path.join(self.temp_dir, self.current_image_info['name'])
+                processed_path = os.path.join(self.processed_dir, self.current_image_info['name'])
+                
+                if os.path.exists(original_path):
+                    import shutil
+                    shutil.copy2(original_path, processed_path)
+                    
+                    # Set the current feature
+                    self.current_feature = "Proteinaceous Debris"
+                    
+                    # Display the image
+                    self.display_image(processed_path)
+                    self.show_post_processing_options()
+                else:
+                    messagebox.showerror("Error", "Original image not found")
+                    
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to prepare for editing: {str(e)}")
 
     def calculate_score(self, area, circularity, white_percentage):
         """Calculate a score based on area, circularity, and white percentage."""
@@ -802,28 +840,45 @@ class CloudImageApp:
 
     def on_edit(self):
         """Handle edit button click"""
+        # Check if processed image exists
+        processed_path = os.path.join(self.processed_dir, self.current_image_info['name'])
+        
+        if not os.path.exists(processed_path):
+            # If not processed, use the original image as starting point
+            original_path = os.path.join(self.temp_dir, self.current_image_info['name'])
+            if os.path.exists(original_path):
+                # Copy original to processed directory to work with
+                shutil.copy2(original_path, processed_path)
+        
         self.enter_edit_mode()
 
     def enter_edit_mode(self):
         """Enter edit mode for the current image."""
         self.setup_edit_ui()
         
-        # Load and display the processed image
+        # Try to load the processed image first, fall back to original if needed
         processed_path = os.path.join(self.processed_dir, self.current_image_info['name'])
-        if os.path.exists(processed_path):
-            self.current_image = cv2.imread(processed_path)
+        image_path = processed_path if os.path.exists(processed_path) else os.path.join(self.temp_dir, self.current_image_info['name'])
+        
+        if os.path.exists(image_path):
+            self.current_image = cv2.imread(image_path)
             
             # Convert and display the image
-            image_pil = Image.open(processed_path).resize((1280, 512))
+            image_pil = Image.open(image_path).resize((1280, 512))
             self.image_tk_edit = ImageTk.PhotoImage(image_pil)
             self.canvas_image = self.edit_canvas.create_image(0, 0, anchor=tk.NW, image=self.image_tk_edit)
+            
+            # Load any existing coordinates
+            coord_file = os.path.join(self.coords_dir, f"{os.path.splitext(self.current_image_info['name'])[0]}_coords.txt")
+            if os.path.exists(coord_file):
+                self.rectangles = self.load_coordinates(self.current_image_info['name'])
             
             # Bind mouse events
             self.edit_canvas.bind("<ButtonPress-1>", self.on_drag_start)
             self.edit_canvas.bind("<B1-Motion>", self.on_drag_move)
             self.edit_canvas.bind("<ButtonRelease-1>", self.on_drag_end)
         else:
-            messagebox.showerror("Error", "Processed image not found")
+            messagebox.showerror("Error", "Image not found")
             self.setup_initial_ui()
 
 

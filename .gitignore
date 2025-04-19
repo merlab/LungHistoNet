@@ -18,4 +18,4 @@ Eval/out/*
 
 Application/coords
 Application/*.json
-Application/tet.ipynb
+Application/test_upload_download.ipynb

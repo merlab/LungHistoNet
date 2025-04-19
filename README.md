@@ -27,7 +27,7 @@ LungHistoNet is a deep learning project that utilizes Vision Transformers to ana
    Follow the instructions to log in (ensure you verify your email to log in successfully).
 3. Pull the application by running the following command:
    ```bash
-   docker pull amirhosseinebrahimi/lung-injury:latset_v5
+   docker pull amirhosseinebrahimi/lung-injury:latset_v7
    ```
 
 ### Step 4: Install Brew
@@ -48,13 +48,8 @@ LungHistoNet is a deep learning project that utilizes Vision Transformers to ana
    brew install socat
    ```
 
-### Step 6: Create Project Directories
-1. Create a directory where you want to store all project materials, e.g., on the Desktop named `LungInjury`.
-2. Inside `LungInjury`, create the following subdirectories:
-   - `Tiles` (to store images).
-   - `Coordinates` (to store coordinates).
 
-### Step 7: Set Up Display for the Application
+### Step 6: Set Up Display for the Application
 1. Open Terminal and set up the display (leave the Terminal open after pressing Enter):
    
 -  MacOS
@@ -71,23 +66,13 @@ LungHistoNet is a deep learning project that utilizes Vision Transformers to ana
 
    ```bash
    docker run -it --rm -e DISPLAY=host.docker.internal:0 \
-   -v /Users/XXX/Desktop/LungInjury/Tile2/ALI_Study4_Jun_2022_Mouse_8:/app/data \
-   -v /Users/XXX/Desktop/LungInjury/Coordinates/ALI_Study4_Jun_2022_Mouse_8:/app/coordinates \
-   -v /Users/XXX/Desktop/LungInjury/State:/app/state \
-   -v /Users/XXX/Desktop/LungInjury/Processed:/app/processed -v \
-   amirhosseinebrahimi/lung-injury:latset_v5
+   amirhosseinebrahimi/lung-injury:latset_v7
    ```
-
 -  Linux (debian)
    ```BASH
    sudo docker run -it --rm   -e DISPLAY=$DISPLAY  \
    -v /tmp/.X11-unix:/tmp/.X11-unix   \
-   -v /home/XXX/Desktop/Lung_Injury/Tiles/1:/app/data  \
-   -v /home/XXX/Desktop/Lung_Injury/Coordinates/1:/app/coordinates  \
-   -v /home/XXX/Desktop/Lung_Injury/State:/app/state \
-   -v /home/XXX/Desktop/Lung_Injury/Processed:/app/processed  \
-   -v /home/XXX/Desktop/Lung_Injury/Final:/app/final  \
-   amirhosseinebrahimi/lung-injury:latest_v5
+   amirhosseinebrahimi/lung-injury:latest_v7
 
    ```
    

@@ -13,20 +13,43 @@ from googleapiclient.http import MediaIoBaseDownload
 from googleapiclient.discovery import build
 import json
 
+
 class CloudImageApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Cloud-Based Lung Injury Analysis")
 
+        # Initialize attributes
+        self.feature_type = tk.StringVar(value="Neutrophils")
+        self.feature_colors = {
+            "Neutrophils": (0, 255, 0),
+            "Hyaline Membranes": (255, 0, 0),
+            "Proteinaceous Debris": (0, 0, 255)
+        }
+        
         # Cloud configuration
         self.service_account_file = "lunginsightcloud-933a30e4085c.json"
         self.scopes = ['https://www.googleapis.com/auth/drive']
-        self.input_folder_id = "1kTVr2h11XlnV3xntxjZbPNZebJ8vr5SX"  # Cloud input folder
-        self.output_folder_id = "1XrfiMR4nLvKb2kx7MiwwBfdZlpOmT9ub"  # Cloud output folder
-        self.coordinates_folder_id = "1XrfiMR4nLvKb2kx7MiwwBfdZlpOmT9ub"  # Coordinates folder
+        self.input_folder_id = "1kTVr2h11XlnV3xntxjZbPNZebJ8vr5SX"
+        self.output_folder_id = "1XrfiMR4nLvKb2kx7MiwwBfdZlpOmT9ub"
+        self.coordinates_folder_id = "1XrfiMR4nLvKb2kx7MiwwBfdZlpOmT9ub"
 
-        self.current_image_info = {}  # To store current image metadata
+        # Other attributes
+        self.current_image_info = {}
+        self.rectangles = []
+        self.image_index = 0
+        self.image_list = []
+        self.start_x = None
+        self.start_y = None
+        self.end_x = None
+        self.end_y = None
+        self.rect_id = None
+        self.mode = tk.StringVar(value="Add")
+        self.current_image = None
+        self.current_feature = "Neutrophils"
+        self.image_processed = False  # Track if image was processed or edited
 
+        # Get username
         self.user_name = self.get_username()
         if not self.user_name:
             self.root.quit()
@@ -36,25 +59,19 @@ class CloudImageApp:
         self.drive_service = self.initialize_drive_service()
         self.drive = self.initialize_google_drive()
 
-        # Application state
-        self.start_x = None
-        self.start_y = None
-        self.end_x = None
-        self.end_y = None
-        self.rect_id = None
-        self.mode = tk.StringVar(value="Add")
-        self.current_image = None
-        self.rectangles = []
-        self.image_index = 0
-        self.image_list = []
-        
-        # Temporary directories
+        # Create temporary directories
         self.temp_dir = tempfile.mkdtemp()
         self.processed_dir = os.path.join(self.temp_dir, "processed")
         self.final_dir = os.path.join(self.temp_dir, "final")
         self.state_dir = os.path.join(self.temp_dir, "state")
         self.coords_dir = os.path.join(self.temp_dir, "coordinates")
         
+        self.main_frame = ttk.Frame(root)
+        self.main_frame.pack(fill=tk.BOTH, expand=True)
+
+        # Setup UI
+        self.setup_initial_ui()
+
         os.makedirs(self.processed_dir, exist_ok=True)
         os.makedirs(self.final_dir, exist_ok=True)
         os.makedirs(self.state_dir, exist_ok=True)
@@ -63,26 +80,119 @@ class CloudImageApp:
         # Load images from cloud
         self.load_cloud_images()
 
-        # Load previous state if available
+        # Load previous state
         if self.load_state():
-            # Ensure image_index is valid
             if self.image_index >= len(self.image_list):
                 self.image_index = 0
         else:
             self.image_index = 0
 
-        # GUI Elements
-        self.setup_ui()
-
-        # Load the current image
+        # Load current image
         if self.image_list:
             self.load_image()
         else:
             messagebox.showerror("Error", "No images found in cloud folder")
             self.root.quit()
 
-        # Save state on close
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+
+    def setup_initial_ui(self):
+        """Setup the initial processing UI"""
+        # Clear any existing widgets
+        for widget in self.main_frame.winfo_children():
+            widget.destroy()
+        
+        # Image display - using main_frame
+        self.image_label = ttk.Label(self.main_frame)
+        self.image_label.pack(pady=10)
+        
+        # Feature selection - single instance in main_frame
+        self.feature_frame = ttk.Frame(self.main_frame)
+        self.feature_frame.pack(pady=5)
+        
+        ttk.Label(self.feature_frame, text="Feature:").pack(side=tk.LEFT)
+        ttk.Radiobutton(self.feature_frame, text="Neutrophils", variable=self.feature_type, 
+                      value="Neutrophils").pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(self.feature_frame, text="Hyaline Membranes", variable=self.feature_type,
+                      value="Hyaline Membranes").pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(self.feature_frame, text="Proteinaceous Debris", variable=self.feature_type,
+                      value="Proteinaceous Debris").pack(side=tk.LEFT, padx=5)
+        
+        # Button frame - in main_frame
+        self.button_frame = ttk.Frame(self.main_frame)
+        self.button_frame.pack(pady=5)
+        
+        self.continue_button = ttk.Button(self.button_frame, text="Process", command=self.on_continue)
+        self.next_button = ttk.Button(self.button_frame, text="Next Image", command=self.load_next_image)
+        self.continue_button.pack(side=tk.LEFT, padx=5)
+        self.next_button.pack(side=tk.RIGHT, padx=5)
+
+    def save_final_image(self):
+        """Save the edited image and coordinates locally, but do not upload."""
+        try:
+            self.update_coordinates_file()
+            
+            final_path = os.path.join(self.final_dir, self.current_image_info['name'])
+            processed_path = os.path.join(self.processed_dir, self.current_image_info['name'])
+            
+            if os.path.exists(processed_path):
+                image = cv2.imread(processed_path)
+                
+                for rect in self.rectangles:
+                    x1, y1, x2, y2, class_name = rect
+                    color = self.feature_colors.get(class_name, (0, 255, 0))
+                    cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
+                    cv2.putText(image, class_name, (x1, y1-10), 
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+                
+                cv2.imwrite(final_path, image)
+                print(f"Saved final image with {len(self.rectangles)} rectangles: {final_path}")
+                self.image_processed = True
+                
+                # messagebox.showinfo("Success", "Edits saved locally. Click 'Next Image' to upload to cloud.")
+                self.clear_edit_widgets()
+                self.setup_initial_ui()
+                self.display_image(processed_path)  # Redisplay current image without resetting rectangles
+            else:
+                print(f"Processed image not found: {processed_path}")
+                messagebox.showerror("Error", "No processed image found. Please process the image first.")
+                
+        except Exception as e:
+            print(f"Failed to save edited image: {str(e)}")
+            messagebox.showerror("Error", f"Failed to save edited image: {str(e)}")
+
+
+    def setup_edit_ui(self):
+        """Setup the editing UI"""
+        # Clear any existing widgets
+        for widget in self.main_frame.winfo_children():
+            widget.destroy()
+        
+        # Filename display
+        self.mode_label_name = ttk.Entry(self.main_frame, width=50)
+        self.mode_label_name.insert(0, f"{self.current_image_info['name']}")
+        self.mode_label_name.config(state='readonly')
+        self.mode_label_name.pack()
+        
+        # Mode selection
+        self.mode_label = ttk.Label(self.main_frame, text="Mode:")
+        self.mode_label.pack()
+        
+        self.add_radio = ttk.Radiobutton(self.main_frame, text="Add", variable=self.mode, value="Add", command=self.update_mode)
+        self.remove_radio = ttk.Radiobutton(self.main_frame, text="Remove", variable=self.mode, value="Remove", command=self.update_mode)
+        self.add_radio.pack()
+        self.remove_radio.pack()
+        
+        # Edit canvas - single image display
+        self.edit_canvas = tk.Canvas(self.main_frame, width=1280, height=512, bg="gray")
+        self.edit_canvas.pack()
+        
+        # Finalize button
+        self.finalize_button = ttk.Button(self.main_frame, text="Save", command=self.save_final_image)
+        self.finalize_button.pack(pady=5)
+
+
 
     def save_state(self):
         """Save the current application state to a JSON file and overwrite in Google Drive by deleting existing file."""
@@ -311,6 +421,7 @@ class CloudImageApp:
     def upload_to_drive(self, file_path, file_name, parent_folder_id):
         """Upload a file to Google Drive."""
         try:
+            print(f"Attempting to upload {file_name} to folder ID {parent_folder_id}")
             file_metadata = {
                 'title': file_name,
                 'parents': [{'id': parent_folder_id}]
@@ -318,31 +429,25 @@ class CloudImageApp:
             file_to_upload = self.drive.CreateFile(file_metadata)
             file_to_upload.SetContentFile(file_path)
             file_to_upload.Upload()
+            print(f"Successfully uploaded {file_name}")
             return True
         except Exception as e:
-            messagebox.showerror("Upload Error", f"Failed to upload file: {str(e)}")
+            print(f"Upload failed for {file_name}: {str(e)}")
+            messagebox.showerror("Upload Error", f"Failed to upload {file_name}: {str(e)}")
             return False
 
-    def setup_ui(self):
-        """Initialize the user interface."""
-        self.image_label = tk.Label(self.root)
-        self.image_label.pack(pady=10)
-
-        self.continue_button = tk.Button(self.root, text="Process", command=self.on_continue)
-        self.next_button = tk.Button(self.root, text="Next Image", command=self.load_next_image)
-        self.continue_button.pack(side=tk.LEFT, padx=5)
-        self.next_button.pack(side=tk.RIGHT, padx=5)
-
     def load_image(self):
-        """Load and display the current image."""
+        """Load and display the current image without resetting rectangles."""
         self.current_image_info = self.image_list[self.image_index]
         temp_image_path = os.path.join(self.temp_dir, self.current_image_info['name'])
         
+        self.feature_type.set("Neutrophils")
+        
         if self.download_from_drive(self.current_image_info['id'], temp_image_path):
             self.current_image_path = temp_image_path
-            coord_file_name = f"{os.path.splitext(self.current_image_info['name'])[0]}_coords.txt"
-            self.rectangles = self.load_coordinates(coord_file_name)
             self.display_image(temp_image_path)
+        else:
+            messagebox.showerror("Error", f"Failed to download image: {self.current_image_info['name']}")
 
     def display_image(self, image_path):
         """Display the image in the GUI."""
@@ -350,43 +455,53 @@ class CloudImageApp:
             image = Image.open(image_path)
             image = image.resize((1280, 512))
             self.image_tk = ImageTk.PhotoImage(image)
-            self.image_label.config(image=self.image_tk)
+            
+            # Check if we're in normal mode (using label)
+            if hasattr(self, 'image_label') and self.image_label.winfo_exists():
+                self.image_label.config(image=self.image_tk)
+                
         except Exception as e:
             messagebox.showerror("Error", f"Failed to display image: {str(e)}")
 
     def on_continue(self):
-        """Process the current image."""
-        self.process_image()
+        """Process the current image based on selected feature."""
+        # Store selected feature for this image
+        self.current_feature = self.feature_type.get()
+        
+        if self.current_feature == "Neutrophils":
+            self.process_neutrophils()
+        elif self.current_feature == "Hyaline Membranes":
+            self.process_hyaline_membranes()
+        elif self.current_feature == "Proteinaceous Debris":
+            self.process_proteinaceous_debris()
+        else:
+            messagebox.showerror("Error", "Unknown feature type selected")
+            return
 
-    def calculate_score(self, area, circularity, white_percentage):
-        """Calculate a score based on area, circularity, and white percentage."""
-        area_score = min(max((area - 100) / (1000 - 100), 0), 1)
-        circularity_score = min(max((circularity - 0.48) / (1 - 0.48), 0), 1)
-        white_percentage_score = min(max((white_percentage - 0.05) / (1 - 0.05), 0), 1)
+        # Reset feature selection after processing
+        self.feature_type.set("Neutrophils")
 
-        score = 0.15 * area_score + 0.7 * circularity_score + 0.15 * white_percentage_score
-        return score
-
-    def process_image(self):
-        """Process the image to detect contours and calculate scores."""
+    def process_neutrophils(self):
+        """Process neutrophils and add to the combined features list."""
         try:
             tile = cv2.imread(self.current_image_path)
             image_intact = tile.copy()
 
+            # Pre-processing
             tile[tile > 220] = 255
             gray_tile = cv2.cvtColor(tile, cv2.COLOR_BGR2GRAY)
 
+            # Thresholding
             _, thresh = cv2.threshold(gray_tile, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
             contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
+            # Create masks
             mask = np.zeros_like(gray_tile)
             cv2.drawContours(mask, contours, -1, 255, thickness=cv2.FILLED)
 
             internal_mask = cv2.bitwise_not(mask)
             internal_only = cv2.bitwise_and(thresh, thresh, mask=internal_mask)
             internal_contours, _ = cv2.findContours(internal_only, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-            self.rectangles = []
 
             for contour in contours:
                 area = cv2.contourArea(contour)
@@ -426,101 +541,196 @@ class CloudImageApp:
 
                     if score < 0.15:
                         continue
-                    red = int(255 * (1 - score))
-                    green = int(255 * score)
-                    color = (0, green, red)
-
+                    
+                    color = self.feature_colors["Neutrophils"]
                     cv2.rectangle(tile, (x, y), (x + w, y + h), color, 2)
 
                     score_text = f"{score * 100:.2f}%"
                     text_position = (x, y - 10)
                     cv2.putText(tile, score_text, text_position, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
 
-                    self.rectangles.append((x, y, x + w, y + h, color))
+                    # Add to rectangles list with feature type
+                    self.rectangles.append((x, y, x + w, y + h, "Neutrophils"))
 
             # Save processed image
             processed_path = os.path.join(self.processed_dir, self.current_image_info['name'])
-
             cv2.imwrite(processed_path, tile)
+            print(f"Saved processed image: {processed_path}")
             
-            # Update coordinates file
+            # Update the single coordinates file
             self.update_coordinates_file()
             
-            # Display processed image
+            # Display the image
             self.display_image(processed_path)
-            
-            # Show post-processing options
             self.show_post_processing_options()
 
         except Exception as e:
-            messagebox.showerror("Processing Error", f"Image processing failed: {str(e)}")
+            print(f"Neutrophil processing failed: {str(e)}")
+            messagebox.showerror("Processing Error", f"Neutrophil processing failed: {str(e)}")
+
+
+    def process_hyaline_membranes(self):
+        """Placeholder for Hyaline Membranes processing."""
+        messagebox.showinfo("Info", "Hyaline Membranes processing will be implemented soon")
+        self.display_image(self.current_image_path)
+        self.show_post_processing_options()
+
+    def process_proteinaceous_debris(self):
+        """Placeholder for Proteinaceous Debris processing."""
+        messagebox.showinfo("Info", "Proteinaceous Debris processing will be implemented soon")
+        self.display_image(self.current_image_path)
+        self.show_post_processing_options()
+
+
+    def calculate_score(self, area, circularity, white_percentage):
+        """Calculate a score based on area, circularity, and white percentage."""
+        area_score = min(max((area - 100) / (1000 - 100), 0), 1)
+        circularity_score = min(max((circularity - 0.48) / (1 - 0.48), 0), 1)
+        white_percentage_score = min(max((white_percentage - 0.05) / (1 - 0.05), 0), 1)
+
+        score = 0.15 * area_score + 0.7 * circularity_score + 0.15 * white_percentage_score
+        return score
 
     def update_coordinates_file(self):
-        """Update the coordinates file with the current rectangles."""
+        """Update a single coordinates file with all rectangles for the current image."""
         coord_file = os.path.join(self.coords_dir, f"{os.path.splitext(self.current_image_info['name'])[0]}_coords.txt")
-        
+        print(f"Updating coordinates file: {coord_file}")
+        print(f"Current rectangles: {self.rectangles}")
         with open(coord_file, "w") as file:
             for rect in self.rectangles:
-                x1, y1, x2, y2, color = rect
-                file.write(f"{x1},{y1},{x2},{y2},{color[0]},{color[1]},{color[2]}\n")
+                x1, y1, x2, y2, class_name = rect
+                file.write(f"{x1},{y1},{x2},{y2},{class_name}\n")
+        print(f"Coordinates file updated with {len(self.rectangles)} rectangles")
 
     def load_coordinates(self, image_name):
-        """Load coordinates from the coordinates file."""
+        """Load coordinates with class names."""
         coord_file = os.path.join(self.coords_dir, f"{os.path.splitext(image_name)[0]}_coords.txt")
         rectangles = []
         
         if os.path.exists(coord_file):
             with open(coord_file, "r") as file:
                 for line in file:
-                    x1, y1, x2, y2, r, g, b = map(int, line.strip().split(","))
-                    color = (r, g, b)
-                    rectangles.append((x1, y1, x2, y2, color))
+                    parts = line.strip().split(',')
+                    if len(parts) == 5:  # x1,y1,x2,y2,class
+                        x1, y1, x2, y2 = map(int, parts[:4])
+                        class_name = parts[4]
+                        color = self.feature_colors.get(class_name, (0, 255, 0))  # Default to green
+                        rectangles.append((x1, y1, x2, y2, class_name))
         
         return rectangles
 
     def show_post_processing_options(self):
         """Show options after processing the image."""
-        for widget in self.root.pack_slaves():
-            if isinstance(widget, tk.Button):
-                widget.destroy()
+        # Remove the process/next buttons
+        self.continue_button.pack_forget()
+        self.next_button.pack_forget()
 
-        self.save_button = tk.Button(self.root, text="Save", command=self.on_save)
-        self.edit_button = tk.Button(self.root, text="Edit", command=self.on_edit)
+        # Add save/edit buttons to the existing button_frame
+        self.save_button = ttk.Button(self.button_frame, text="Save", command=self.on_save)
+        self.edit_button = ttk.Button(self.button_frame, text="Edit", command=self.on_edit)
         self.save_button.pack(side=tk.LEFT, padx=5)
         self.edit_button.pack(side=tk.RIGHT, padx=5)
 
+
     def on_save(self):
-        """Save the processed image with user/mouse folder structure"""
+        """Save the processed image locally, but do not upload."""
         try:
-            # Create user folder first
-            user_folder_id = self.create_or_get_user_folder()
-            
-            # Create mouse folder under user folder
-            mouse_name = self.current_image_info['gene']
-            mouse_folder_id = self.create_or_get_mouse_folder(mouse_name, user_folder_id)
-            
-            # Prepare files
             final_path = os.path.join(self.final_dir, self.current_image_info['name'])
             processed_path = os.path.join(self.processed_dir, self.current_image_info['name'])
             
             if os.path.exists(processed_path):
                 image = cv2.imread(processed_path)
-                cv2.imwrite(final_path, image)
                 
-                # Upload to mouse-specific folder under user folder
-                if self.upload_to_drive(final_path, self.current_image_info['name'], mouse_folder_id):
-                    coord_file = os.path.join(self.coords_dir, f"{os.path.splitext(self.current_image_info['name'])[0]}_coords.txt")
-                    if os.path.exists(coord_file):
-                        self.upload_to_drive(coord_file, os.path.basename(coord_file), mouse_folder_id)
-                    
-                    messagebox.showinfo("Success", 
-                        f"Saved to:\n{self.user_name}/{mouse_name}/\n"
-                        f"File: {self.current_image_info['name']}")
-                    self.load_next_image()
+                for rect in self.rectangles:
+                    x1, y1, x2, y2, class_name = rect
+                    color = self.feature_colors.get(class_name, (0, 255, 0))
+                    cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
+                    cv2.putText(image, class_name, (x1, y1-10), 
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+                
+                cv2.imwrite(final_path, image)
+                self.update_coordinates_file()
+                print(f"Saved processed image with {len(self.rectangles)} rectangles: {final_path}")
+                self.image_processed = True
+                
+                messagebox.showinfo("Success", "Image saved locally. Click 'Next Image' to upload to cloud.")
+                self.setup_initial_ui()
+                self.display_image(processed_path)  # Redisplay current image without resetting rectangles
+            else:
+                print(f"Processed image not found: {processed_path}")
+                messagebox.showerror("Error", "No processed image found. Please process the image first.")
         
         except Exception as e:
+            print(f"Save failed: {str(e)}")
             messagebox.showerror("Error", f"Save failed: {str(e)}")
 
+
+    def finalize_and_upload(self):
+        """Upload the final image and single coordinates file to Google Drive."""
+        try:
+            if not self.image_processed:
+                print(f"Skipping upload for {self.current_image_info['name']}: Image not processed")
+                messagebox.showwarning("Warning", "Image not processed. Please process and save before uploading.")
+                return
+            
+            # Ensure the coordinates file is up-to-date
+            self.update_coordinates_file()
+            
+            final_path = os.path.join(self.final_dir, self.current_image_info['name'])
+            coord_file = os.path.join(self.coords_dir, f"{os.path.splitext(self.current_image_info['name'])[0]}_coords.txt")
+            
+            if not os.path.exists(final_path):
+                print(f"Final image not found: {final_path}")
+                messagebox.showerror("Error", f"Final image not found: {self.current_image_info['name']}. Please save the image first.")
+                return
+            
+            if not os.path.exists(coord_file):
+                print(f"Coordinates file not found: {coord_file}. Creating empty file.")
+                with open(coord_file, "w") as f:
+                    pass
+            
+            print(f"Final dir contents: {os.listdir(self.final_dir)}")
+            print(f"Coords dir contents: {os.listdir(self.coords_dir)}")
+            
+            user_folder_id = self.create_or_get_user_folder()
+            mouse_name = self.current_image_info['gene']
+            mouse_folder_id = self.create_or_get_mouse_folder(mouse_name, user_folder_id)
+            print(f"Uploading to folder: {self.user_name}/{mouse_name} (ID: {mouse_folder_id})")
+            
+            print(f"Uploading image: {final_path}")
+            if not self.upload_to_drive(final_path, self.current_image_info['name'], mouse_folder_id):
+                print(f"Failed to upload image: {final_path}")
+                return
+            
+            print(f"Uploading coordinates: {coord_file}")
+            if not self.upload_to_drive(coord_file, os.path.basename(coord_file), mouse_folder_id):
+                print(f"Failed to upload coordinates: {coord_file}")
+                return
+            
+            # messagebox.showinfo("Success", f"Uploaded {self.current_image_info['name']} and coordinates to {self.user_name}/{mouse_name}")
+            self.image_processed = False
+            
+        except Exception as e:
+            print(f"Upload failed: {str(e)}")
+            messagebox.showerror("Error", f"Failed to upload to cloud: {str(e)}")
+
+    def load_next_image(self):
+        """Load the next image and upload the previous image's files if processed."""
+        if self.current_image_info:
+            print(f"Processing upload for image: {self.current_image_info['name']}")
+            self.finalize_and_upload()
+        
+        self.image_index += 1
+        self.image_processed = False
+        self.rectangles = []  # Reset after upload
+        
+        if self.image_index >= len(self.image_list):
+            messagebox.showinfo("Complete", "All images processed!")
+            self.root.quit()
+            return
+        
+        self.save_state()
+        self.load_image()
 
     def verify_folder_structure(self):
         """Debug method to verify folder structure exists"""
@@ -591,53 +801,31 @@ class CloudImageApp:
             raise
 
     def on_edit(self):
-        """Enter edit mode."""
+        """Handle edit button click"""
         self.enter_edit_mode()
 
     def enter_edit_mode(self):
         """Enter edit mode for the current image."""
-        # First clear all widgets
-        for widget in self.root.pack_slaves():
-            widget.destroy()
-
-        # Add filename display
-        self.mode_label_name = tk.Entry(self.root, width=50)
-        self.mode_label_name.insert(0, f"{self.current_image_info['name']}")
-        self.mode_label_name.config(state='readonly')
-        self.mode_label_name.pack()
-
-        # Add mode selection
-        self.mode_label = tk.Label(self.root, text="Mode:")
-        self.mode_label.pack()
-        self.add_radio = tk.Radiobutton(self.root, text="Add", variable=self.mode, value="Add", command=self.update_mode)
-        self.remove_radio = tk.Radiobutton(self.root, text="Remove", variable=self.mode, value="Remove", command=self.update_mode)
-        self.add_radio.pack()
-        self.remove_radio.pack()
-
-        # Create and pack the edit canvas
-        self.edit_canvas = tk.Canvas(self.root, width=1280, height=512, bg="gray")
-        self.edit_canvas.pack()
-
-        # Load and display the processed image only in the canvas
+        self.setup_edit_ui()
+        
+        # Load and display the processed image
         processed_path = os.path.join(self.processed_dir, self.current_image_info['name'])
-        self.current_image = cv2.imread(processed_path)
-        
-        # Convert and display the image
-        image_pil = Image.open(processed_path).resize((1280, 512))
-        self.image_tk_edit = ImageTk.PhotoImage(image_pil)
-        
-        # Clear any existing image on canvas and add new one
-        self.edit_canvas.delete("all")
-        self.canvas_image = self.edit_canvas.create_image(0, 0, anchor=tk.NW, image=self.image_tk_edit)
+        if os.path.exists(processed_path):
+            self.current_image = cv2.imread(processed_path)
+            
+            # Convert and display the image
+            image_pil = Image.open(processed_path).resize((1280, 512))
+            self.image_tk_edit = ImageTk.PhotoImage(image_pil)
+            self.canvas_image = self.edit_canvas.create_image(0, 0, anchor=tk.NW, image=self.image_tk_edit)
+            
+            # Bind mouse events
+            self.edit_canvas.bind("<ButtonPress-1>", self.on_drag_start)
+            self.edit_canvas.bind("<B1-Motion>", self.on_drag_move)
+            self.edit_canvas.bind("<ButtonRelease-1>", self.on_drag_end)
+        else:
+            messagebox.showerror("Error", "Processed image not found")
+            self.setup_initial_ui()
 
-        # Bind mouse events
-        self.edit_canvas.bind("<ButtonPress-1>", self.on_drag_start)
-        self.edit_canvas.bind("<B1-Motion>", self.on_drag_move)
-        self.edit_canvas.bind("<ButtonRelease-1>", self.on_drag_end)
-
-        # Add save button
-        self.finalize_button = tk.Button(self.root, text="Save", command=self.save_final_image)
-        self.finalize_button.pack(side=tk.RIGHT, padx=5)
 
     def on_drag_start(self, event):
         """Handle the start of dragging."""
@@ -683,10 +871,17 @@ class CloudImageApp:
             self.redraw_image()
 
     def save_rectangle(self, x1, y1, x2, y2):
-        """Save a rectangle to the list."""
-        color = (0, 255, 0)
-        self.rectangles.append((x1, y1, x2, y2, color))
+        """Save a rectangle with the currently selected feature type."""
+        class_name = self.feature_type.get()
+        # Check for duplicate rectangles
+        new_rect = (x1, y1, x2, y2, class_name)
+        if new_rect not in self.rectangles:
+            self.rectangles.append(new_rect)
+            print(f"Added rectangle: {new_rect}")
+        else:
+            print(f"Skipped duplicate rectangle: {new_rect}")
         self.update_coordinates_file()
+        self.redraw_image()
 
     def remove_rectangle(self, x, y):
         """Remove a rectangle from the list."""
@@ -701,10 +896,11 @@ class CloudImageApp:
         scaled_x = int(x * scale_x)
         scaled_y = int(y * scale_y)
 
-        for rect in self.rectangles:
+        for rect in self.rectangles[:]:  # Iterate over a copy to safely remove
             x1, y1, x2, y2, _ = rect
             if x1 <= scaled_x <= x2 and y1 <= scaled_y <= y2:
                 self.rectangles.remove(rect)
+                print(f"Removed rectangle: {rect}")
                 self.update_coordinates_file()
                 self.redraw_image()
 
@@ -725,13 +921,19 @@ class CloudImageApp:
                 return
 
     def redraw_image(self):
-        """Redraw the image with the current rectangles."""
+        """Redraw the image with rectangles colored by feature type."""
         base_image_path = os.path.join(self.processed_dir, self.current_image_info['name'])
         image = cv2.imread(base_image_path)
 
         for rect in self.rectangles:
-            x1, y1, x2, y2, color = rect
+            x1, y1, x2, y2, class_name = rect
+            color = self.feature_colors.get(class_name, (0, 255, 0))  # Default to green
             cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
+
+            # Add class label
+            label = f"{class_name}"
+            cv2.putText(image, label, (x1, y1 - 20), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
 
         updated_image_path = os.path.join(self.processed_dir, self.current_image_info['name'])
         cv2.imwrite(updated_image_path, image)
@@ -746,63 +948,144 @@ class CloudImageApp:
         elif self.mode.get() == "Remove":
             self.edit_canvas.config(cursor="crosshair")
 
-    def save_final_image(self):
-        """Save the final image and reset the UI."""
+    def finalize_and_upload(self):
+        """Upload the final image and single coordinates file to Google Drive."""
         try:
-            # Use current_image_info['name'] instead of current_file_name
-            final_path = os.path.join(self.final_dir, self.current_image_info['name'])
-            processed_path = os.path.join(self.processed_dir, self.current_image_info['name'])
+            if not self.image_processed:
+                print(f"Skipping upload for {self.current_image_info['name']}: Image not processed")
+                messagebox.showwarning("Warning", "Image not processed. Please process and save before uploading.")
+                return
             
-            if os.path.exists(processed_path):
-                image = cv2.imread(processed_path)
-                cv2.imwrite(final_path, image)
-                
-                # Get user folder ID
-                user_folder_id = self.create_or_get_user_folder()
-                
-                # Upload to mouse-specific folder
-                mouse_name = self.current_image_info['gene']
-                # Pass both mouse_name and user_folder_id
-                mouse_folder_id = self.create_or_get_mouse_folder(mouse_name, user_folder_id)
-                
-                if self.upload_to_drive(final_path, self.current_image_info['name'], mouse_folder_id):
-                    coord_file = os.path.join(self.coords_dir, f"{os.path.splitext(self.current_image_info['name'])[0]}_coords.txt")
-                    if os.path.exists(coord_file):
-                        self.upload_to_drive(coord_file, os.path.basename(coord_file), mouse_folder_id)
-                    
-                    messagebox.showinfo("Success", f"Results saved to {mouse_name} folder in cloud!")
-                    self.reset_to_initial_page()
-                else:
-                    messagebox.showerror("Error", "Failed to upload to cloud")
-        
+            self.update_coordinates_file()
+            
+            final_path = os.path.join(self.final_dir, self.current_image_info['name'])
+            coord_file = os.path.join(self.coords_dir, f"{os.path.splitext(self.current_image_info['name'])[0]}_coords.txt")
+            
+            if not os.path.exists(final_path):
+                print(f"Final image not found: {final_path}")
+                messagebox.showerror("Error", f"Final image not found: {self.current_image_info['name']}. Please save the image first.")
+                return
+            
+            if not os.path.exists(coord_file):
+                print(f"Coordinates file not found: {coord_file}. Creating empty file.")
+                with open(coord_file, "w") as f:
+                    pass
+            
+            print(f"Final dir contents: {os.listdir(self.final_dir)}")
+            print(f"Coords dir contents: {os.listdir(self.coords_dir)}")
+            
+            user_folder_id = self.create_or_get_user_folder()
+            mouse_name = self.current_image_info['gene']
+            mouse_folder_id = self.create_or_get_mouse_folder(mouse_name, user_folder_id)
+            print(f"Uploading to folder: {self.user_name}/{mouse_name} (ID: {mouse_folder_id})")
+            
+            print(f"Uploading image: {final_path}")
+            if not self.upload_to_drive(final_path, self.current_image_info['name'], mouse_folder_id):
+                print(f"Failed to upload image: {final_path}")
+                return
+            
+            print(f"Uploading coordinates: {coord_file}")
+            if not self.upload_to_drive(coord_file, os.path.basename(coord_file), mouse_folder_id):
+                print(f"Failed to upload coordinates: {coord_file}")
+                return
+            
+            # messagebox.showinfo("Success", f"Uploaded {self.current_image_info['name']} and coordinates to {self.user_name}/{mouse_name}")
+            self.image_processed = False
+            
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to save final image: {str(e)}")
+            print(f"Upload failed: {str(e)}")
+            messagebox.showerror("Error", f"Failed to upload to cloud: {str(e)}")
+
+
+    def clear_edit_widgets(self):
+        """Safely remove edit mode widgets."""
+        widgets_to_remove = [
+            'mode_label_name', 'mode_label', 'add_radio', 
+            'remove_radio', 'edit_canvas', 'finalize_button'
+        ]
+        
+        for widget_name in widgets_to_remove:
+            if hasattr(self, widget_name):
+                widget = getattr(self, widget_name)
+                try:
+                    widget.pack_forget()
+                    widget.destroy()
+                except tk.TclError:
+                    pass  # Widget might already be destroyed
+                except Exception as e:
+                    print(f"Error removing widget {widget_name}: {str(e)}")
+                finally:
+                    if hasattr(self, widget_name):
+                        delattr(self, widget_name)
+
 
     def reset_to_initial_page(self):
         """Reset the UI to the initial state."""
-        for widget in self.root.pack_slaves():
-            widget.destroy()
+        # First ensure all edit widgets are cleared
+        self.clear_edit_widgets()
         
-        self.image_label = tk.Label(self.root)
-        self.image_label.pack(pady=10)
+        # Make sure basic widgets exist
+        if not hasattr(self, 'image_label'):
+            self.image_label = tk.Label(self.root)
+            self.image_label.pack(pady=10)
         
-        self.continue_button = tk.Button(self.root, text="Process", command=self.on_continue)
-        self.next_button = tk.Button(self.root, text="Next Image", command=self.load_next_image)
+        if not hasattr(self, 'button_frame'):
+            self.button_frame = tk.Frame(self.root)
+            self.button_frame.pack(pady=5)
+        
+        # Recreate buttons if needed
+        if not hasattr(self, 'continue_button'):
+            self.continue_button = tk.Button(self.button_frame, text="Process", command=self.on_continue)
+            self.continue_button.pack(side=tk.LEFT, padx=5)
+        
+        if not hasattr(self, 'next_button'):
+            self.next_button = tk.Button(self.button_frame, text="Next Image", command=self.load_next_image)
+            self.next_button.pack(side=tk.RIGHT, padx=5)
+        
+        # Redisplay the image
+        self.load_image()
+
+    def reset_to_initial_page(self):
+        """Reset the UI to the initial state."""
+        # Only remove the edit-specific widgets
+        if hasattr(self, 'mode_label_name'):
+            self.mode_label_name.pack_forget()
+        if hasattr(self, 'mode_label'):
+            self.mode_label.pack_forget()
+        if hasattr(self, 'add_radio'):
+            self.add_radio.pack_forget()
+        if hasattr(self, 'remove_radio'):
+            self.remove_radio.pack_forget()
+        if hasattr(self, 'edit_canvas'):
+            self.edit_canvas.pack_forget()
+        if hasattr(self, 'finalize_button'):
+            self.finalize_button.pack_forget()
+
+        # Show the original buttons
         self.continue_button.pack(side=tk.LEFT, padx=5)
         self.next_button.pack(side=tk.RIGHT, padx=5)
         
         self.load_next_image()
 
     def load_next_image(self):
-        """Load the next image in the list."""
+        """Load the next image and upload the previous image's files if processed."""
+        # Upload the current image's files if it was processed
+        if self.current_image_info:
+            print(f"Processing upload for image: {self.current_image_info['name']}")
+            self.finalize_and_upload()
+        else:
+            print("No current image to upload")
+        
         self.image_index += 1
+        self.image_processed = False  # Reset for the next image
+        self.rectangles = []  # Clear rectangles for the next image
         
         if self.image_index >= len(self.image_list):
             messagebox.showinfo("Complete", "All images processed!")
             self.root.quit()
             return
         
-        self.save_state()  # Save state after moving to next image
+        self.save_state()
         self.load_image()
 
     def cleanup(self):
@@ -818,11 +1101,11 @@ class CloudImageApp:
             print(f"Cleanup error: {str(e)}")
 
     def on_close(self):
-        """Handle application close."""
-        self.save_state()  # Save state before closing
+        """Handle application close without uploading."""
+        print("Closing application, no upload performed")
+        self.save_state()
         self.cleanup()
         self.root.quit()
-
 
 if __name__ == "__main__":
     root = tk.Tk()

@@ -17,7 +17,7 @@ from googleapiclient.http import MediaIoBaseDownload
 from googleapiclient.discovery import build
 import json
 import shutil
-
+import uuid
 
 class CloudImageApp:
     def __init__(self, root):
@@ -1182,9 +1182,8 @@ class CloudImageApp:
         )
         self.variability_button.pack(side=tk.LEFT, padx=5)
 
-    
     def generate_variability_plots(self):
-        """Generate inter-observer variability plots from Google Drive data."""
+        """Generate inter-observer variability plots from Google Drive data and display in a new window."""
         try:
             # Create a temporary directory for processing
             temp_dir = tempfile.mkdtemp()
@@ -1212,8 +1211,11 @@ class CloudImageApp:
             # Step 3: Download and process the data
             self.process_observer_data(observers, common_images, temp_dir)
             
-            # Step 4: Generate the plots
-            self.generate_visualizations(temp_dir)
+            # Step 4: Generate the plots and collect PNG paths
+            image_files = self.generate_visualizations(temp_dir)
+            
+            # Step 5: Display plots in a new window
+            self.display_plots_window(image_files)
             
             messagebox.showinfo(
                 "Success", 
@@ -1448,7 +1450,7 @@ class CloudImageApp:
             raise
 
     def generate_visualizations(self, temp_dir):
-        """Generate the inter-observer variability plots."""
+        """Generate the inter-observer variability plots and return list of PNG file paths."""
         try:
             # Create directories for output
             summary_dir = os.path.join(temp_dir, "summary")
@@ -1476,6 +1478,9 @@ class CloudImageApp:
                 observers[1]: "#84C5A1"
             }
             
+            # List to store PNG file paths
+            image_files = []
+            
             # For each mouse condition, generate summary and plots
             mouse_conditions = set()
             
@@ -1495,15 +1500,15 @@ class CloudImageApp:
                     summary_data = []
                     
                     # Get all images for this mouse
-                    image_files = []
+                    image_files_list = []
                     for observer in observers:
                         observer_dir = os.path.join(temp_dir, observer)
                         for file in os.listdir(observer_dir):
                             if file.startswith(mouse) and file.endswith('_coords.txt'):
-                                image_files.append(file)
+                                image_files_list.append(file)
                     
                     # For each image, count features for each observer
-                    for coord_file in set(image_files):  # Use set to avoid duplicates
+                    for coord_file in set(image_files_list):  # Use set to avoid duplicates
                         image_name = coord_file.replace('_coords.txt', '')
                         counts = {observer: 0 for observer in observers}
                         
@@ -1536,17 +1541,20 @@ class CloudImageApp:
                     summary_file = os.path.join(summary_dir, f"label_summary_{mouse}_{feature.replace(' ', '_')}.csv")
                     df.to_csv(summary_file, index=False)
                     
-                    # Generate visualization
-                    self.create_variability_plot(
+                    # Generate visualization and store PNG path
+                    image_path = self.create_variability_plot(
                         df, mouse, feature, observers, color_mapping, viz_dir
                     )
-                    
+                    image_files.append((feature, image_path))
+            
+            return image_files
+            
         except Exception as e:
             print(f"Error generating visualizations: {str(e)}")
             raise
 
     def create_variability_plot(self, df, mouse, feature, observers, color_mapping, viz_dir):
-        """Create a single variability plot."""
+        """Create a single variability plot and return the PNG file path."""
         try:
             # Calculate percentages
             df['Total'] = df[observers].sum(axis=1) + df['Common']
@@ -1605,18 +1613,51 @@ class CloudImageApp:
                 height=600
             )
             
-            # Save the visualization
-            viz_filename = f"inter_observer_{mouse}_{feature.replace(' ', '_')}.html"
+            # Save the visualization as PNG
+            viz_filename = f"inter_observer_{mouse}_{feature.replace(' ', '_')}.png"
             viz_path = os.path.join(viz_dir, viz_filename)
-            fig.write_html(viz_path)
+            fig.write_image(viz_path, format="png")
             
-            # Open the plot in the default web browser
-            import webbrowser
-            webbrowser.open(viz_path)
+            return viz_path
             
         except Exception as e:
             print(f"Error creating plot for {mouse} {feature}: {str(e)}")
             raise
+
+    def display_plots_window(self, image_files):
+        """Display all variability plots in a new Tkinter window."""
+        try:
+            # Create a new top-level window
+            plot_window = tk.Toplevel(self.root)
+            plot_window.title("Inter-Observer Variability Plots")
+            plot_window.geometry("1280x800")
+            
+            # Create a notebook for tabbed interface
+            notebook = ttk.Notebook(plot_window)
+            notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+            
+            # Add each PNG plot to a separate tab
+            for feature, image_path in image_files:
+                # Create a frame for this tab
+                tab_frame = ttk.Frame(notebook)
+                notebook.add(tab_frame, text=feature)
+                
+                # Load and display the image
+                image = Image.open(image_path)
+                # Resize to fit window if necessary, maintaining aspect ratio
+                image = image.resize((1200, 600), Image.LANCZOS)
+                photo = ImageTk.PhotoImage(image)
+                
+                # Create a label to display the image
+                image_label = ttk.Label(tab_frame, image=photo)
+                image_label.image = photo  # Keep a reference to avoid garbage collection
+                image_label.pack(padx=10, pady=10)
+            
+            # Ensure the window is destroyed properly
+            plot_window.protocol("WM_DELETE_WINDOW", plot_window.destroy)
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to display plots: {str(e)}")
 
 if __name__ == "__main__":
     root = tk.Tk()

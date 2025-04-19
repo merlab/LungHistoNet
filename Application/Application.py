@@ -4,8 +4,12 @@ from PIL import Image, ImageTk
 import os
 import cv2
 import numpy as np
+import pandas as pd
 import tempfile
 import io
+from io import BytesIO
+import plotly.graph_objects as go
+from concurrent.futures import ProcessPoolExecutor
 from pydrive2.auth import GoogleAuth
 from pydrive2.drive import GoogleDrive
 from oauth2client.service_account import ServiceAccountCredentials
@@ -35,6 +39,7 @@ class CloudImageApp:
         self.output_folder_id = "1XrfiMR4nLvKb2kx7MiwwBfdZlpOmT9ub"
         self.coordinates_folder_id = "1XrfiMR4nLvKb2kx7MiwwBfdZlpOmT9ub"
 
+        self.interobplt_thresh = 1
         # Other attributes
         self.current_image_info = {}
         self.rectangles = []
@@ -114,11 +119,11 @@ class CloudImageApp:
         
         ttk.Label(self.feature_frame, text="Feature:").pack(side=tk.LEFT)
         ttk.Radiobutton(self.feature_frame, text="Neutrophils", variable=self.feature_type, 
-                      value="Neutrophils").pack(side=tk.LEFT, padx=5)
+                    value="Neutrophils").pack(side=tk.LEFT, padx=5)
         ttk.Radiobutton(self.feature_frame, text="Hyaline Membranes", variable=self.feature_type,
-                      value="Hyaline Membranes").pack(side=tk.LEFT, padx=5)
+                    value="Hyaline Membranes").pack(side=tk.LEFT, padx=5)
         ttk.Radiobutton(self.feature_frame, text="Proteinaceous Debris", variable=self.feature_type,
-                      value="Proteinaceous Debris").pack(side=tk.LEFT, padx=5)
+                    value="Proteinaceous Debris").pack(side=tk.LEFT, padx=5)
         
         # Button frame - in main_frame
         self.button_frame = ttk.Frame(self.main_frame)
@@ -126,8 +131,12 @@ class CloudImageApp:
         
         self.continue_button = ttk.Button(self.button_frame, text="Process", command=self.on_continue)
         self.next_button = ttk.Button(self.button_frame, text="Next Image", command=self.load_next_image)
+        self.variability_button = ttk.Button(self.button_frame, text="Inter-Observer Variability Plot", 
+                                        command=self.generate_variability_plots)
+        
         self.continue_button.pack(side=tk.LEFT, padx=5)
-        self.next_button.pack(side=tk.RIGHT, padx=5)
+        self.next_button.pack(side=tk.LEFT, padx=5)
+        self.variability_button.pack(side=tk.LEFT, padx=5)
 
     def save_final_image(self):
         """Save the edited image and coordinates locally, but do not upload."""
@@ -1161,6 +1170,453 @@ class CloudImageApp:
         self.save_state()
         self.cleanup()
         self.root.quit()
+
+
+
+    def add_variability_plot_button(self):
+        """Add the variability plot button to the UI."""
+        self.variability_button = ttk.Button(
+            self.button_frame, 
+            text="Inter-Observer Variability Plot", 
+            command=self.generate_variability_plots
+        )
+        self.variability_button.pack(side=tk.LEFT, padx=5)
+
+    
+    def generate_variability_plots(self):
+        """Generate inter-observer variability plots from Google Drive data."""
+        try:
+            # Create a temporary directory for processing
+            temp_dir = tempfile.mkdtemp()
+            
+            # Step 1: Get all observers from the output folder
+            observers = self.get_observers_from_drive()
+            
+            if len(observers) < 2:
+                messagebox.showinfo(
+                    "Info", 
+                    f"Need at least 2 observers for comparison. Found {len(observers)} observer(s)."
+                )
+                return
+                
+            # Step 2: Find common images that all observers have processed
+            common_images = self.find_common_images(observers)
+            
+            if len(common_images) < self.interobplt_thresh:
+                messagebox.showinfo(
+                    "Info", 
+                    f"Need at least {self.interobplt_thresh} common images for comparison. Found {len(common_images)} common images."
+                )
+                return
+                
+            # Step 3: Download and process the data
+            self.process_observer_data(observers, common_images, temp_dir)
+            
+            # Step 4: Generate the plots
+            self.generate_visualizations(temp_dir)
+            
+            messagebox.showinfo(
+                "Success", 
+                f"Generated variability plots for {len(observers)} observers and {len(common_images)} common images."
+            )
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to generate plots: {str(e)}")
+        finally:
+            # Clean up temporary files
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
+
+    def get_observers_from_drive(self):
+        """Get list of observers from the output folder."""
+        try:
+            # Query for all folders in the output folder (each folder is an observer)
+            query = f"'{self.output_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+            folders = self.drive_service.files().list(
+                q=query, 
+                fields="files(name,id)"
+            ).execute().get('files', [])
+            
+            return [folder['name'] for folder in folders]
+            
+        except Exception as e:
+            print(f"Error getting observers: {str(e)}")
+            return []
+
+    def find_common_images(self, observers):
+        """Find images that all observers have processed."""
+        try:
+            # Get the list of mouse folders for each observer
+            observer_mice = {}
+            for observer in observers:
+                # Get observer folder ID
+                query = f"name='{observer}' and '{self.output_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+                observer_folder = self.drive_service.files().list(
+                    q=query, 
+                    fields="files(id)"
+                ).execute().get('files', [])
+                
+                if not observer_folder:
+                    continue
+                    
+                observer_folder_id = observer_folder[0]['id']
+                
+                # Get all mouse folders for this observer
+                query = f"'{observer_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+                mouse_folders = self.drive_service.files().list(
+                    q=query, 
+                    fields="files(name)"
+                ).execute().get('files', [])
+                
+                observer_mice[observer] = {mf['name'] for mf in mouse_folders}
+            
+            # Find common mice across all observers
+            common_mice = set.intersection(*observer_mice.values())
+            
+            # Now find images that exist for all observers in these common mice
+            common_images = []
+            
+            for mouse in common_mice:
+                # Get images for first observer as reference
+                first_observer = observers[0]
+                query = f"name='{first_observer}' and '{self.output_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+                first_observer_folder = self.drive_service.files().list(
+                    q=query, 
+                    fields="files(id)"
+                ).execute().get('files', [])
+                
+                if not first_observer_folder:
+                    continue
+                    
+                first_observer_folder_id = first_observer_folder[0]['id']
+                
+                query = f"name='{mouse}' and '{first_observer_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+                mouse_folder = self.drive_service.files().list(
+                    q=query, 
+                    fields="files(id)"
+                ).execute().get('files', [])
+                
+                if not mouse_folder:
+                    continue
+                    
+                mouse_folder_id = mouse_folder[0]['id']
+                
+                # Get all images for this mouse from first observer
+                query = f"'{mouse_folder_id}' in parents and mimeType!='application/vnd.google-apps.folder' and trashed=false"
+                images = self.drive_service.files().list(
+                    q=query, 
+                    fields="files(name)"
+                ).execute().get('files', [])
+                
+                # Check if these images exist for all other observers
+                for image in images:
+                    image_name = image['name']
+                    if image_name.lower().endswith(('.png', '.jpg', '.jpeg')):
+                        # Check if all other observers have this image
+                        all_have = True
+                        for observer in observers[1:]:
+                            if not self.image_exists_for_observer(observer, mouse, image_name):
+                                all_have = False
+                                break
+                                
+                        if all_have:
+                            common_images.append((mouse, image_name))
+                            
+            return common_images
+            
+        except Exception as e:
+            print(f"Error finding common images: {str(e)}")
+            return []
+
+    def image_exists_for_observer(self, observer, mouse, image_name):
+        """Check if an image exists for a specific observer and mouse."""
+        try:
+            # Get observer folder
+            query = f"name='{observer}' and '{self.output_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+            observer_folder = self.drive_service.files().list(
+                q=query, 
+                fields="files(id)"
+            ).execute().get('files', [])
+            
+            if not observer_folder:
+                return False
+                
+            observer_folder_id = observer_folder[0]['id']
+            
+            # Get mouse folder
+            query = f"name='{mouse}' and '{observer_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+            mouse_folder = self.drive_service.files().list(
+                q=query, 
+                fields="files(id)"
+            ).execute().get('files', [])
+            
+            if not mouse_folder:
+                return False
+                
+            mouse_folder_id = mouse_folder[0]['id']
+            
+            # Check if image exists
+            query = f"name='{image_name}' and '{mouse_folder_id}' in parents and trashed=false"
+            images = self.drive_service.files().list(
+                q=query, 
+                fields="files(id)"
+            ).execute().get('files', [])
+            
+            return len(images) > 0
+            
+        except Exception as e:
+            print(f"Error checking image existence: {str(e)}")
+            return False
+
+    def process_observer_data(self, observers, common_images, temp_dir):
+        """Download and process data from all observers."""
+        try:
+            # Create directories for each observer
+            observer_dirs = {}
+            for observer in observers:
+                observer_dir = os.path.join(temp_dir, observer)
+                os.makedirs(observer_dir, exist_ok=True)
+                observer_dirs[observer] = observer_dir
+                
+            # Download data for each common image
+            for mouse, image_name in common_images:
+                for observer in observers:
+                    # Get the image file
+                    image_path = os.path.join(observer_dirs[observer], image_name)
+                    coord_file = os.path.splitext(image_name)[0] + "_coords.txt"
+                    coord_path = os.path.join(observer_dirs[observer], coord_file)
+                    
+                    # Download the image and coordinates
+                    self.download_observer_files(observer, mouse, image_name, image_path, coord_path)
+                    
+        except Exception as e:
+            print(f"Error processing observer data: {str(e)}")
+            raise
+
+    def download_observer_files(self, observer, mouse, image_name, image_path, coord_path):
+        """Download image and coordinates file for an observer."""
+        try:
+            # Get observer folder
+            query = f"name='{observer}' and '{self.output_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+            observer_folder = self.drive_service.files().list(
+                q=query, 
+                fields="files(id)"
+            ).execute().get('files', [])
+            
+            if not observer_folder:
+                raise FileNotFoundError(f"Observer folder not found: {observer}")
+                
+            observer_folder_id = observer_folder[0]['id']
+            
+            # Get mouse folder
+            query = f"name='{mouse}' and '{observer_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+            mouse_folder = self.drive_service.files().list(
+                q=query, 
+                fields="files(id)"
+            ).execute().get('files', [])
+            
+            if not mouse_folder:
+                raise FileNotFoundError(f"Mouse folder not found: {mouse}")
+                
+            mouse_folder_id = mouse_folder[0]['id']
+            
+            # Download image
+            query = f"name='{image_name}' and '{mouse_folder_id}' in parents and trashed=false"
+            image_files = self.drive_service.files().list(
+                q=query, 
+                fields="files(id)"
+            ).execute().get('files', [])
+            
+            if not image_files:
+                raise FileNotFoundError(f"Image not found: {image_name}")
+                
+            self.download_from_drive(image_files[0]['id'], image_path)
+            
+            # Download coordinates file
+            coord_name = os.path.splitext(image_name)[0] + "_coords.txt"
+            query = f"name='{coord_name}' and '{mouse_folder_id}' in parents and trashed=false"
+            coord_files = self.drive_service.files().list(
+                q=query, 
+                fields="files(id)"
+            ).execute().get('files', [])
+            
+            if coord_files:  # Coordinates file is optional
+                self.download_from_drive(coord_files[0]['id'], coord_path)
+                
+        except Exception as e:
+            print(f"Error downloading files for {observer}/{mouse}/{image_name}: {str(e)}")
+            raise
+
+    def generate_visualizations(self, temp_dir):
+        """Generate the inter-observer variability plots."""
+        try:
+            # Create directories for output
+            summary_dir = os.path.join(temp_dir, "summary")
+            viz_dir = os.path.join(temp_dir, "visualizations")
+            os.makedirs(summary_dir, exist_ok=True)
+            os.makedirs(viz_dir, exist_ok=True)
+            
+            # Get all observers
+            observers = [d for d in os.listdir(temp_dir) if os.path.isdir(os.path.join(temp_dir, d))]
+            
+            if len(observers) < 2:
+                raise ValueError("Need at least 2 observers for comparison")
+                
+            # Class mapping
+            class_mapping = {
+                "Neutrophils": 0,
+                "Hyaline Membranes": 1,
+                "Proteinaceous Debris": 2
+            }
+            
+            # Color mapping
+            color_mapping = {
+                observers[0]: "#2D6A4F",
+                "Common": "#F4D35E",
+                observers[1]: "#84C5A1"
+            }
+            
+            # For each mouse condition, generate summary and plots
+            mouse_conditions = set()
+            
+            # First find all mouse conditions
+            for observer in observers:
+                observer_dir = os.path.join(temp_dir, observer)
+                for file in os.listdir(observer_dir):
+                    if file.endswith('_coords.txt'):
+                        mouse = file.split('_')[0]  # Assuming format: MouseX_..._coords.txt
+                        mouse_conditions.add(mouse)
+            
+            # Process each mouse condition
+            for mouse in mouse_conditions:
+                # Process each feature
+                for feature in class_mapping.keys():
+                    # Create a summary dataframe
+                    summary_data = []
+                    
+                    # Get all images for this mouse
+                    image_files = []
+                    for observer in observers:
+                        observer_dir = os.path.join(temp_dir, observer)
+                        for file in os.listdir(observer_dir):
+                            if file.startswith(mouse) and file.endswith('_coords.txt'):
+                                image_files.append(file)
+                    
+                    # For each image, count features for each observer
+                    for coord_file in set(image_files):  # Use set to avoid duplicates
+                        image_name = coord_file.replace('_coords.txt', '')
+                        counts = {observer: 0 for observer in observers}
+                        
+                        # Count features for each observer
+                        for observer in observers:
+                            coord_path = os.path.join(temp_dir, observer, coord_file)
+                            if os.path.exists(coord_path):
+                                with open(coord_path, 'r') as f:
+                                    for line in f:
+                                        parts = line.strip().split(',')
+                                        if len(parts) >= 5 and parts[4] == feature:
+                                            counts[observer] += 1
+                        
+                        summary_data.append({
+                            'Image': image_name,
+                            **counts
+                        })
+                    
+                    # Create dataframe
+                    df = pd.DataFrame(summary_data)
+                    
+                    # Calculate common counts (minimum count across observers)
+                    df['Common'] = df[observers].min(axis=1)
+                    
+                    # Subtract common counts from each observer's count
+                    for observer in observers:
+                        df[observer] = df[observer] - df['Common']
+                    
+                    # Save summary CSV
+                    summary_file = os.path.join(summary_dir, f"label_summary_{mouse}_{feature.replace(' ', '_')}.csv")
+                    df.to_csv(summary_file, index=False)
+                    
+                    # Generate visualization
+                    self.create_variability_plot(
+                        df, mouse, feature, observers, color_mapping, viz_dir
+                    )
+                    
+        except Exception as e:
+            print(f"Error generating visualizations: {str(e)}")
+            raise
+
+    def create_variability_plot(self, df, mouse, feature, observers, color_mapping, viz_dir):
+        """Create a single variability plot."""
+        try:
+            # Calculate percentages
+            df['Total'] = df[observers].sum(axis=1) + df['Common']
+            for observer in observers:
+                df[observer] = (df[observer] / df['Total']) * 100
+            df['Common'] = (df['Common'] / df['Total']) * 100
+            
+            # Sort by first observer's percentage
+            df = df.sort_values(by=observers[0], ascending=False)
+            df['index'] = range(len(df))
+            
+            # Create the plot
+            fig = go.Figure()
+            
+            # Add bars for each observer
+            fig.add_trace(go.Bar(
+                x=df['index'],
+                y=df[observers[0]],
+                name=f"<b>{observers[0]}</b>",
+                marker_color=color_mapping[observers[0]]
+            ))
+            
+            fig.add_trace(go.Bar(
+                x=df['index'],
+                y=df["Common"],
+                name="<b>Common</b>",
+                marker_color=color_mapping["Common"],
+                base=df[observers[0]]
+            ))
+            
+            for i, observer in enumerate(observers[1:], 1):
+                base = df[observers[:i]].sum(axis=1) + df['Common']
+                fig.add_trace(go.Bar(
+                    x=df['index'],
+                    y=df[observer],
+                    name=f"<b>{observer}</b>",
+                    marker_color=color_mapping.get(observer, f"hsl({i*60},50%,50%)"),
+                    base=base
+                ))
+            
+            title = f"<b>Inter-Observer Variability of {feature} Counts in {mouse} Tiles</b>"
+            
+            fig.update_layout(
+                barmode='stack',
+                title=title,
+                xaxis_title="<b>Tile Index</b>",
+                yaxis_title="<b>Percentage</b>",
+                xaxis=dict(
+                    tickmode='linear',
+                    tick0=1,
+                    dtick=2
+                ),
+                legend_title="<b>Categories</b>",
+                yaxis=dict(range=[0,100]),
+                width=1200,
+                height=600
+            )
+            
+            # Save the visualization
+            viz_filename = f"inter_observer_{mouse}_{feature.replace(' ', '_')}.html"
+            viz_path = os.path.join(viz_dir, viz_filename)
+            fig.write_html(viz_path)
+            
+            # Open the plot in the default web browser
+            import webbrowser
+            webbrowser.open(viz_path)
+            
+        except Exception as e:
+            print(f"Error creating plot for {mouse} {feature}: {str(e)}")
+            raise
 
 if __name__ == "__main__":
     root = tk.Tk()

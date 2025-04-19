@@ -28,7 +28,7 @@ class CloudImageApp:
         }
         
         # Cloud configuration
-        self.service_account_file = "lunginsightcloud-933a30e4085c.json"
+        self.service_account_file = "lunginsightcloud-fa31002e7988.json"
         self.scopes = ['https://www.googleapis.com/auth/drive']
         self.input_folder_id = "1kTVr2h11XlnV3xntxjZbPNZebJ8vr5SX"
         self.output_folder_id = "1XrfiMR4nLvKb2kx7MiwwBfdZlpOmT9ub"

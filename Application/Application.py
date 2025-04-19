@@ -399,19 +399,85 @@ class CloudImageApp:
         except Exception as e:
             messagebox.showerror("Processing Error", f"Neutrophil processing failed: {str(e)}")
 
+    # def process_hyaline_membranes(self):
+    #     try:
+    #         original_path = os.path.join(self.temp_dir, self.current_image_info['name'])
+    #         processed_path = os.path.join(self.processed_dir, self.current_image_info['name'])
+    #         if os.path.exists(original_path):
+    #             shutil.copy2(original_path, processed_path)
+    #             self.current_feature = "Hyaline Membranes"
+    #             self.display_image(processed_path)
+    #             self.show_post_processing_options()
+    #         else:
+    #             messagebox.showerror("Error", "Original image not found")
+    #     except Exception as e:
+    #         messagebox.showerror("Error", f"Failed to prepare for editing: {str(e)}")
+
     def process_hyaline_membranes(self):
         try:
-            original_path = os.path.join(self.temp_dir, self.current_image_info['name'])
+            # Load the image
+            tile = cv2.imread(self.current_image_path)
+            image_intact = tile.copy()
+
+            # Convert to HSV for better color-based segmentation
+            hsv_tile = cv2.cvtColor(tile, cv2.COLOR_BGR2HSV)
+
+            # Define color range for eosinophilic (pink) regions typical of hyaline membranes
+            lower_pink = np.array([140, 50, 50])  # Adjust based on staining
+            upper_pink = np.array([170, 255, 255])
+            pink_mask = cv2.inRange(hsv_tile, lower_pink, upper_pink)
+
+            # Apply morphological operations to reduce noise and connect regions
+            kernel = np.ones((5, 5), np.uint8)
+            pink_mask = cv2.morphologyEx(pink_mask, cv2.MORPH_CLOSE, kernel)
+            pink_mask = cv2.morphologyEx(pink_mask, cv2.MORPH_OPEN, kernel)
+
+            # Find contours of potential hyaline membrane regions
+            contours, _ = cv2.findContours(pink_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            # Process each contour
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                perimeter = cv2.arcLength(contour, True)
+
+                # Skip small or invalid contours
+                if area < 500 or perimeter == 0:
+                    continue
+
+                # Calculate elongation (hyaline membranes are often linear/elongated)
+                x, y, w, h = cv2.boundingRect(contour)
+                elongation = max(w, h) / min(w, h) if min(w, h) > 0 else 0
+
+                # Calculate color consistency (mean intensity in the pink range)
+                mask = np.zeros_like(pink_mask)
+                cv2.drawContours(mask, [contour], -1, 255, thickness=cv2.FILLED)
+                mean_color = cv2.mean(hsv_tile, mask=mask)[:3]  # Mean HSV values
+                hue_score = 1.0 if 140 <= mean_color[0] <= 170 else 0.5  # Penalize if hue deviates
+
+                # Score the contour based on area, elongation, and color
+                score = self.calculate_hyaline_score(area, elongation, hue_score)
+                if score < 0.3:  # Threshold for confidence
+                    continue
+
+                # Draw rectangle and score
+                color = self.feature_colors.get("Hyaline Membranes", (0, 255, 255))  # Cyan as default
+                cv2.rectangle(tile, (x, y), (x + w, y + h), color, 2)
+                score_text = f"{score * 100:.2f}%"
+                text_position = (x, y - 10)
+                cv2.putText(tile, score_text, text_position, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+
+                # Store rectangle for further use
+                self.rectangles.append((x, y, x + w, y + h, "Hyaline Membranes"))
+
+            # Save and display the processed image
             processed_path = os.path.join(self.processed_dir, self.current_image_info['name'])
-            if os.path.exists(original_path):
-                shutil.copy2(original_path, processed_path)
-                self.current_feature = "Hyaline Membranes"
-                self.display_image(processed_path)
-                self.show_post_processing_options()
-            else:
-                messagebox.showerror("Error", "Original image not found")
+            cv2.imwrite(processed_path, tile)
+            self.update_coordinates_file()
+            self.display_image(processed_path)
+            self.show_post_processing_options()
+
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to prepare for editing: {str(e)}")
+            messagebox.showerror("Processing Error", f"Hyaline membrane processing failed: {str(e)}")
 
     def process_proteinaceous_debris(self):
         try:
@@ -432,6 +498,17 @@ class CloudImageApp:
         circularity_score = min(max((circularity - 0.48) / (1 - 0.48), 0), 1)
         white_percentage_score = min(max((white_percentage - 0.05) / (1 - 0.05), 0), 1)
         score = 0.15 * area_score + 0.7 * circularity_score + 0.15 * white_percentage_score
+        return score
+    
+    def calculate_hyaline_score(self, area, elongation, hue_score):
+        # Normalize area (500 to 5000 as typical range for hyaline membranes)
+        area_score = min(max((area - 500) / (5000 - 500), 0), 1)
+        
+        # Normalize elongation (hyaline membranes are elongated, so favor higher values)
+        elongation_score = min(max((elongation - 2) / (10 - 2), 0), 1)
+        
+        # Combine scores (weights tuned for hyaline membrane characteristics)
+        score = 0.4 * area_score + 0.4 * elongation_score + 0.2 * hue_score
         return score
 
     def update_coordinates_file(self):

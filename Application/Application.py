@@ -23,24 +23,18 @@ class CloudImageApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Cloud-Based Lung Injury Analysis")
-
-        # Initialize attributes
         self.feature_type = tk.StringVar(value="Neutrophils")
         self.feature_colors = {
             "Neutrophils": (0, 255, 0),
             "Hyaline Membranes": (255, 0, 0),
             "Proteinaceous Debris": (0, 0, 255)
         }
-        
-        # Cloud configuration
         self.service_account_file = "lunginsightcloud-fa31002e7988.json"
         self.scopes = ['https://www.googleapis.com/auth/drive']
         self.input_folder_id = "1kTVr2h11XlnV3xntxjZbPNZebJ8vr5SX"
         self.output_folder_id = "1XrfiMR4nLvKb2kx7MiwwBfdZlpOmT9ub"
         self.coordinates_folder_id = "1XrfiMR4nLvKb2kx7MiwwBfdZlpOmT9ub"
-
         self.interobplt_thresh = 1
-        # Other attributes
         self.current_image_info = {}
         self.rectangles = []
         self.image_index = 0
@@ -53,163 +47,106 @@ class CloudImageApp:
         self.mode = tk.StringVar(value="Add")
         self.current_image = None
         self.current_feature = "Neutrophils"
-        self.image_processed = False  # Track if image was processed or edited
-
-        # Get username
+        self.image_processed = False
         self.user_name = self.get_username()
         if not self.user_name:
             self.root.quit()
             return
-
-        # Initialize cloud services
         self.drive_service = self.initialize_drive_service()
         self.drive = self.initialize_google_drive()
-
-        # Create temporary directories
         self.temp_dir = tempfile.mkdtemp()
         self.processed_dir = os.path.join(self.temp_dir, "processed")
         self.final_dir = os.path.join(self.temp_dir, "final")
         self.state_dir = os.path.join(self.temp_dir, "state")
         self.coords_dir = os.path.join(self.temp_dir, "coordinates")
-        
         self.main_frame = ttk.Frame(root)
         self.main_frame.pack(fill=tk.BOTH, expand=True)
-
-        # Setup UI
-        self.setup_initial_ui()
-
         os.makedirs(self.processed_dir, exist_ok=True)
         os.makedirs(self.final_dir, exist_ok=True)
         os.makedirs(self.state_dir, exist_ok=True)
         os.makedirs(self.coords_dir, exist_ok=True)
-
-        # Load images from cloud
+        self.setup_initial_ui()
         self.load_cloud_images()
-
-        # Load previous state
         if self.load_state():
             if self.image_index >= len(self.image_list):
                 self.image_index = 0
         else:
             self.image_index = 0
-
-        # Load current image
         if self.image_list:
             self.load_image()
         else:
             messagebox.showerror("Error", "No images found in cloud folder")
             self.root.quit()
-
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
-
     def setup_initial_ui(self):
-        """Setup the initial processing UI"""
-        # Clear any existing widgets
         for widget in self.main_frame.winfo_children():
             widget.destroy()
-        
-        # Image display - using main_frame
         self.image_label = ttk.Label(self.main_frame)
         self.image_label.pack(pady=10)
-        
-        # Feature selection - single instance in main_frame
         self.feature_frame = ttk.Frame(self.main_frame)
         self.feature_frame.pack(pady=5)
-        
         ttk.Label(self.feature_frame, text="Feature:").pack(side=tk.LEFT)
         ttk.Radiobutton(self.feature_frame, text="Neutrophils", variable=self.feature_type, 
-                    value="Neutrophils").pack(side=tk.LEFT, padx=5)
+                        value="Neutrophils").pack(side=tk.LEFT, padx=5)
         ttk.Radiobutton(self.feature_frame, text="Hyaline Membranes", variable=self.feature_type,
-                    value="Hyaline Membranes").pack(side=tk.LEFT, padx=5)
+                        value="Hyaline Membranes").pack(side=tk.LEFT, padx=5)
         ttk.Radiobutton(self.feature_frame, text="Proteinaceous Debris", variable=self.feature_type,
-                    value="Proteinaceous Debris").pack(side=tk.LEFT, padx=5)
-        
-        # Button frame - in main_frame
+                        value="Proteinaceous Debris").pack(side=tk.LEFT, padx=5)
         self.button_frame = ttk.Frame(self.main_frame)
         self.button_frame.pack(pady=5)
-        
         self.continue_button = ttk.Button(self.button_frame, text="Process", command=self.on_continue)
         self.next_button = ttk.Button(self.button_frame, text="Next Image", command=self.load_next_image)
         self.variability_button = ttk.Button(self.button_frame, text="Inter-Observer Variability Plot", 
-                                        command=self.generate_variability_plots)
-        
+                                             command=self.generate_variability_plots)
         self.continue_button.pack(side=tk.LEFT, padx=5)
         self.next_button.pack(side=tk.LEFT, padx=5)
         self.variability_button.pack(side=tk.LEFT, padx=5)
 
     def save_final_image(self):
-        """Save the edited image and coordinates locally, but do not upload."""
         try:
             self.update_coordinates_file()
-            
             final_path = os.path.join(self.final_dir, self.current_image_info['name'])
-            
-            # Use processed image if available, otherwise use original
             processed_path = os.path.join(self.processed_dir, self.current_image_info['name'])
             if not os.path.exists(processed_path):
                 processed_path = os.path.join(self.temp_dir, self.current_image_info['name'])
-            
             if os.path.exists(processed_path):
                 image = cv2.imread(processed_path)
-                
-                # Draw all rectangles
                 for rect in self.rectangles:
                     x1, y1, x2, y2, class_name = rect
                     color = self.feature_colors.get(class_name, (0, 255, 0))
                     cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
                     cv2.putText(image, class_name, (x1, y1-10), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
-                
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
                 cv2.imwrite(final_path, image)
-                print(f"Saved final image with {len(self.rectangles)} rectangles: {final_path}")
                 self.image_processed = True
-                
                 self.clear_edit_widgets()
                 self.setup_initial_ui()
-                self.display_image(final_path)  # Redisplay saved image
+                self.display_image(final_path)
             else:
-                print(f"Source image not found: {processed_path}")
                 messagebox.showerror("Error", "No source image found.")
-                
         except Exception as e:
-            print(f"Failed to save edited image: {str(e)}")
             messagebox.showerror("Error", f"Failed to save edited image: {str(e)}")
 
-
     def setup_edit_ui(self):
-        """Setup the editing UI"""
-        # Clear any existing widgets
         for widget in self.main_frame.winfo_children():
             widget.destroy()
-        
-        # Filename display
         self.mode_label_name = ttk.Entry(self.main_frame, width=50)
         self.mode_label_name.insert(0, f"{self.current_image_info['name']}")
         self.mode_label_name.config(state='readonly')
         self.mode_label_name.pack()
-        
-        # Mode selection
         self.mode_label = ttk.Label(self.main_frame, text="Mode:")
         self.mode_label.pack()
-        
         self.add_radio = ttk.Radiobutton(self.main_frame, text="Add", variable=self.mode, value="Add", command=self.update_mode)
         self.remove_radio = ttk.Radiobutton(self.main_frame, text="Remove", variable=self.mode, value="Remove", command=self.update_mode)
         self.add_radio.pack()
         self.remove_radio.pack()
-        
-        # Edit canvas - single image display
         self.edit_canvas = tk.Canvas(self.main_frame, width=1280, height=512, bg="gray")
         self.edit_canvas.pack()
-        
-        # Finalize button
         self.finalize_button = ttk.Button(self.main_frame, text="Save", command=self.save_final_image)
         self.finalize_button.pack(pady=5)
 
-
-
     def save_state(self):
-        """Save the current application state to a JSON file and overwrite in Google Drive by deleting existing file."""
         try:
             state = {
                 'user_name': self.user_name,
@@ -217,108 +154,67 @@ class CloudImageApp:
                 'current_image_info': self.current_image_info
             }
             state_file_path = os.path.join(self.state_dir, 'app_state.json')
-            
-            # Save state to local file
             with open(state_file_path, 'w') as f:
                 json.dump(state, f)
-            
-            # Get user folder ID
             user_folder_id = self.create_or_get_user_folder()
-            
-            # Check if app_state.json already exists and delete it
             query = f"'{user_folder_id}' in parents and name='app_state.json' and trashed=false"
             existing_files = self.drive_service.files().list(
                 q=query, 
                 fields="files(id, name)"
             ).execute().get('files', [])
-            
             for file in existing_files:
                 self.drive_service.files().delete(fileId=file['id']).execute()
-                print(f"🗑️ Deleted existing app_state.json (ID: {file['id']})")
-            
-            # Upload new file
             self.upload_to_drive(state_file_path, 'app_state.json', user_folder_id)
-            print(f"✅ Uploaded new app_state.json in folder: {self.user_name}")
-                
         except Exception as e:
-            print(f"❌ Failed to save state: {str(e)}")
+            pass
 
     def initialize_drive_service(self):
-        """Initialize Google Drive service."""
         creds = ServiceAccountCredentials.from_json_keyfile_name(
             self.service_account_file, self.scopes)
         return build('drive', 'v3', credentials=creds)
-        
+
     def get_username(self):
-        """Prompt for username before starting processing"""
         dialog = tk.Toplevel(self.root)
         dialog.title("User Identification")
         dialog.geometry("300x150")
-        
         tk.Label(dialog, text="Please enter your name:").pack(pady=10)
         entry = tk.Entry(dialog)
         entry.pack(pady=5)
-        
         result = []
-        
         def on_ok():
             result.append(entry.get())
             dialog.destroy()
-        
         tk.Button(dialog, text="Submit", command=on_ok).pack(pady=10)
-        
         dialog.wait_window()
         return result[0] if result else None
-    
 
     def load_state(self):
-        """Load the application state from Google Drive if it exists."""
         try:
-            # Get user folder ID
             user_folder_id = self.create_or_get_user_folder()
-            
-            # Check if state file exists in user's folder
             query = f"'{user_folder_id}' in parents and name='app_state.json' and trashed=false"
             state_files = self.drive_service.files().list(q=query, fields="files(id)").execute().get('files', [])
-            
             if state_files:
                 state_file_id = state_files[0]['id']
                 state_file_path = os.path.join(self.state_dir, 'app_state.json')
-                
-                # Download state file
                 if self.download_from_drive(state_file_id, state_file_path):
                     with open(state_file_path, 'r') as f:
                         state = json.load(f)
-                    
-                    # Validate state
                     saved_image_info = state.get('current_image_info', {})
                     if saved_image_info:
-                        # Check if the image still exists in the image_list
                         for img in self.image_list:
                             if img['id'] == saved_image_info.get('id'):
                                 self.user_name = state.get('user_name', self.user_name)
                                 self.image_index = state.get('image_index', 0)
                                 self.current_image_info = saved_image_info
-                                print(f"Loaded state: user={self.user_name}, image_index={self.image_index}")
                                 return True
-                    
-                    print("ℹInvalid state (image not found), starting fresh.")
-                    return False
-                    
-            print("ℹNo previous state found, starting fresh.")
             return False
-        
         except Exception as e:
-            print(f"Failed to load state: {str(e)}")
             return False
-    
+
     def create_output_folder(self):
-        """Create the complete output path: username/original_folder"""
         try:
-            # 1. First create/verify user folder
             user_query = f"name='{self.user_name}' and '{self.output_folder_id}' in parents and mimeType='application/vnd.google-apps.folder'"
             user_folders = self.drive_service.files().list(q=user_query, fields="files(id,name)").execute().get('files', [])
-            
             if not user_folders:
                 user_metadata = {
                     'name': self.user_name,
@@ -330,16 +226,11 @@ class CloudImageApp:
                     fields='id,name'
                 ).execute()
                 user_folder_id = user_folder['id']
-                print(f"Created user folder: {self.user_name} (ID: {user_folder_id})")
             else:
                 user_folder_id = user_folders[0]['id']
-                print(f"ℹUsing existing user folder: {self.user_name} (ID: {user_folder_id})")
-
-            # 2. Create the original folder (full name, no splitting)
-            original_folder = self.current_image_info['gene']  # e.g. "Mouse1_GeneA"
+            original_folder = self.current_image_info['gene']
             folder_query = f"name='{original_folder}' and '{user_folder_id}' in parents and mimeType='application/vnd.google-apps.folder'"
             existing_folders = self.drive_service.files().list(q=folder_query, fields="files(id,name)").execute().get('files', [])
-            
             if not existing_folders:
                 folder_metadata = {
                     'name': original_folder,
@@ -350,25 +241,16 @@ class CloudImageApp:
                     body=folder_metadata, 
                     fields='id,name'
                 ).execute()
-                print(f"reated folder: {original_folder} (ID: {new_folder['id']})")
                 return new_folder['id']
-            
-            print(f"ℹUsing existing folder: {original_folder} (ID: {existing_folders[0]['id']})")
             return existing_folders[0]['id']
-            
         except Exception as e:
-            print(f"Folder creation failed: {str(e)}")
             raise
 
-
     def create_or_get_folder(self, folder_name, parent_id):
-        """Create folder or return existing one"""
         query = f"'{parent_id}' in parents and name='{folder_name}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
         existing = self.drive_service.files().list(q=query, fields="files(id)").execute().get('files', [])
-        
         if existing:
             return existing[0]['id']
-        
         folder_metadata = {
             'name': folder_name,
             'mimeType': 'application/vnd.google-apps.folder',
@@ -378,64 +260,48 @@ class CloudImageApp:
         return folder['id']
 
     def initialize_google_drive(self):
-        """Initialize PyDrive GoogleDrive instance."""
         gauth = GoogleAuth()
         gauth.credentials = ServiceAccountCredentials.from_json_keyfile_name(
             self.service_account_file, self.scopes)
         return GoogleDrive(gauth)
 
     def load_cloud_images(self):
-        """Load image list from Google Drive folder including subfolders."""
         try:
-            # Query to get all folders in the input folder
             folders = self.drive_service.files().list(
                 q=f"'{self.input_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
                 fields="files(id, name)").execute().get('files', [])
-            
             self.image_list = []
-            
-            # Process each gene folder
             for folder in folders:
-                # Get all images in this gene folder
                 images = self.drive_service.files().list(
                     q=f"'{folder['id']}' in parents and trashed=false",
                     fields="files(id, name, mimeType)").execute().get('files', [])
-                
                 for img in images:
                     if img['name'].lower().endswith(('.png', '.jpg', '.jpeg')):
-                        # Store both image info and parent folder (gene) name
                         self.image_list.append({
                             'id': img['id'],
                             'name': img['name'],
-                            'gene': folder['name']  # Add gene name to image info
+                            'gene': folder['name']
                         })
-            
             if not self.image_list:
                 raise FileNotFoundError("No images found in cloud folder")
-                
         except Exception as e:
             messagebox.showerror("Cloud Error", f"Failed to load image list: {str(e)}")
 
     def download_from_drive(self, file_id, destination_path):
-        """Download a file from Google Drive."""
         try:
             request = self.drive_service.files().get_media(fileId=file_id)
             fh = io.FileIO(destination_path, 'wb')
             downloader = MediaIoBaseDownload(fh, request)
-            
             done = False
             while not done:
                 status, done = downloader.next_chunk()
-            
             return True
         except Exception as e:
             messagebox.showerror("Download Error", f"Failed to download file: {str(e)}")
             return False
 
     def upload_to_drive(self, file_path, file_name, parent_folder_id):
-        """Upload a file to Google Drive."""
         try:
-            print(f"Attempting to upload {file_name} to folder ID {parent_folder_id}")
             file_metadata = {
                 'title': file_name,
                 'parents': [{'id': parent_folder_id}]
@@ -443,20 +309,15 @@ class CloudImageApp:
             file_to_upload = self.drive.CreateFile(file_metadata)
             file_to_upload.SetContentFile(file_path)
             file_to_upload.Upload()
-            print(f"Successfully uploaded {file_name}")
             return True
         except Exception as e:
-            print(f"Upload failed for {file_name}: {str(e)}")
             messagebox.showerror("Upload Error", f"Failed to upload {file_name}: {str(e)}")
             return False
 
     def load_image(self):
-        """Load and display the current image without resetting rectangles."""
         self.current_image_info = self.image_list[self.image_index]
         temp_image_path = os.path.join(self.temp_dir, self.current_image_info['name'])
-        
         self.feature_type.set("Neutrophils")
-        
         if self.download_from_drive(self.current_image_info['id'], temp_image_path):
             self.current_image_path = temp_image_path
             self.display_image(temp_image_path)
@@ -464,24 +325,17 @@ class CloudImageApp:
             messagebox.showerror("Error", f"Failed to download image: {self.current_image_info['name']}")
 
     def display_image(self, image_path):
-        """Display the image in the GUI."""
         try:
             image = Image.open(image_path)
             image = image.resize((1280, 512))
             self.image_tk = ImageTk.PhotoImage(image)
-            
-            # Check if we're in normal mode (using label)
             if hasattr(self, 'image_label') and self.image_label.winfo_exists():
                 self.image_label.config(image=self.image_tk)
-                
         except Exception as e:
             messagebox.showerror("Error", f"Failed to display image: {str(e)}")
 
     def on_continue(self):
-        """Process the current image based on selected feature."""
-        # Store selected feature for this image
         self.current_feature = self.feature_type.get()
-        
         if self.current_feature == "Neutrophils":
             self.process_neutrophils()
         elif self.current_feature == "Hyaline Membranes":
@@ -491,327 +345,203 @@ class CloudImageApp:
         else:
             messagebox.showerror("Error", "Unknown feature type selected")
             return
-
-        # Reset feature selection after processing
         self.feature_type.set("Neutrophils")
 
     def process_neutrophils(self):
-        """Process neutrophils and add to the combined features list."""
         try:
             tile = cv2.imread(self.current_image_path)
             image_intact = tile.copy()
-
-            # Pre-processing
             tile[tile > 220] = 255
             gray_tile = cv2.cvtColor(tile, cv2.COLOR_BGR2GRAY)
-
-            # Thresholding
             _, thresh = cv2.threshold(gray_tile, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
             contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-            # Create masks
             mask = np.zeros_like(gray_tile)
             cv2.drawContours(mask, contours, -1, 255, thickness=cv2.FILLED)
-
             internal_mask = cv2.bitwise_not(mask)
             internal_only = cv2.bitwise_and(thresh, thresh, mask=internal_mask)
             internal_contours, _ = cv2.findContours(internal_only, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
             for contour in contours:
                 area = cv2.contourArea(contour)
                 perimeter = cv2.arcLength(contour, True)
-
                 if perimeter == 0:
                     continue
-
                 circularity = 4 * np.pi * (area / (perimeter * perimeter))
-
                 if 300 < area < 900 and 0.5 < circularity < 1:
                     x, y, w, h = cv2.boundingRect(contour)
-
                     k = 1.05
                     padding = int(k * np.sqrt(area))
-
                     center_x = x + w // 2
                     center_y = y + h // 2
-
                     radius = padding
                     radius = min(radius, center_x, center_y, tile.shape[1] - center_x, tile.shape[0] - center_y)
-
                     neighborhood_mask = np.zeros_like(thresh, dtype=np.uint8)
                     cv2.circle(neighborhood_mask, (center_x, center_y), radius, 255, thickness=-1)
-
                     neighborhood = cv2.bitwise_and(thresh, thresh, mask=neighborhood_mask)
-
                     total_pixels = cv2.countNonZero(neighborhood_mask)
                     light_areas_mask = cv2.inRange(tile, (200, 200, 200), (255, 255, 255))
-
                     neighborhood_light = cv2.bitwise_and(light_areas_mask, light_areas_mask, mask=neighborhood_mask)
                     white_pixels = cv2.countNonZero(neighborhood_light)
-
                     white_percentage = white_pixels / total_pixels
-
                     score = self.calculate_score(area, circularity, white_percentage)
-
                     if score < 0.15:
                         continue
-                    
                     color = self.feature_colors["Neutrophils"]
                     cv2.rectangle(tile, (x, y), (x + w, y + h), color, 2)
-
                     score_text = f"{score * 100:.2f}%"
                     text_position = (x, y - 10)
                     cv2.putText(tile, score_text, text_position, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
-
-                    # Add to rectangles list with feature type
                     self.rectangles.append((x, y, x + w, y + h, "Neutrophils"))
-
-            # Save processed image
             processed_path = os.path.join(self.processed_dir, self.current_image_info['name'])
             cv2.imwrite(processed_path, tile)
-            print(f"Saved processed image: {processed_path}")
-            
-            # Update the single coordinates file
             self.update_coordinates_file()
-            
-            # Display the image
             self.display_image(processed_path)
             self.show_post_processing_options()
-
         except Exception as e:
-            print(f"Neutrophil processing failed: {str(e)}")
             messagebox.showerror("Processing Error", f"Neutrophil processing failed: {str(e)}")
 
-
     def process_hyaline_membranes(self):
-        """Prepare for Hyaline Membranes editing."""
         try:
-            # Just copy the original image to processed directory
             original_path = os.path.join(self.temp_dir, self.current_image_info['name'])
             processed_path = os.path.join(self.processed_dir, self.current_image_info['name'])
-            
             if os.path.exists(original_path):
-                import shutil
                 shutil.copy2(original_path, processed_path)
-                
-                # Set the current feature
                 self.current_feature = "Hyaline Membranes"
-                
-                # Display the image
                 self.display_image(processed_path)
                 self.show_post_processing_options()
             else:
                 messagebox.showerror("Error", "Original image not found")
-                
         except Exception as e:
             messagebox.showerror("Error", f"Failed to prepare for editing: {str(e)}")
 
     def process_proteinaceous_debris(self):
-            """Prepare for Proteinaceous Debris editing."""
-            try:
-                # Just copy the original image to processed directory
-                original_path = os.path.join(self.temp_dir, self.current_image_info['name'])
-                processed_path = os.path.join(self.processed_dir, self.current_image_info['name'])
-                
-                if os.path.exists(original_path):
-                    import shutil
-                    shutil.copy2(original_path, processed_path)
-                    
-                    # Set the current feature
-                    self.current_feature = "Proteinaceous Debris"
-                    
-                    # Display the image
-                    self.display_image(processed_path)
-                    self.show_post_processing_options()
-                else:
-                    messagebox.showerror("Error", "Original image not found")
-                    
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to prepare for editing: {str(e)}")
+        try:
+            original_path = os.path.join(self.temp_dir, self.current_image_info['name'])
+            processed_path = os.path.join(self.processed_dir, self.current_image_info['name'])
+            if os.path.exists(original_path):
+                shutil.copy2(original_path, processed_path)
+                self.current_feature = "Proteinaceous Debris"
+                self.display_image(processed_path)
+                self.show_post_processing_options()
+            else:
+                messagebox.showerror("Error", "Original image not found")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to prepare for editing: {str(e)}")
 
     def calculate_score(self, area, circularity, white_percentage):
-        """Calculate a score based on area, circularity, and white percentage."""
         area_score = min(max((area - 100) / (1000 - 100), 0), 1)
         circularity_score = min(max((circularity - 0.48) / (1 - 0.48), 0), 1)
         white_percentage_score = min(max((white_percentage - 0.05) / (1 - 0.05), 0), 1)
-
         score = 0.15 * area_score + 0.7 * circularity_score + 0.15 * white_percentage_score
         return score
 
     def update_coordinates_file(self):
-        """Update a single coordinates file with all rectangles for the current image."""
         coord_file = os.path.join(self.coords_dir, f"{os.path.splitext(self.current_image_info['name'])[0]}_coords.txt")
-        print(f"Updating coordinates file: {coord_file}")
-        print(f"Current rectangles: {self.rectangles}")
         with open(coord_file, "w") as file:
             for rect in self.rectangles:
                 x1, y1, x2, y2, class_name = rect
                 file.write(f"{x1},{y1},{x2},{y2},{class_name}\n")
-        print(f"Coordinates file updated with {len(self.rectangles)} rectangles")
 
     def load_coordinates(self, image_name):
-        """Load coordinates with class names."""
         coord_file = os.path.join(self.coords_dir, f"{os.path.splitext(image_name)[0]}_coords.txt")
         rectangles = []
-        
         if os.path.exists(coord_file):
             with open(coord_file, "r") as file:
                 for line in file:
                     parts = line.strip().split(',')
-                    if len(parts) == 5:  # x1,y1,x2,y2,class
+                    if len(parts) == 5:
                         x1, y1, x2, y2 = map(int, parts[:4])
                         class_name = parts[4]
-                        color = self.feature_colors.get(class_name, (0, 255, 0))  # Default to green
+                        color = self.feature_colors.get(class_name, (0, 255, 0))
                         rectangles.append((x1, y1, x2, y2, class_name))
-        
         return rectangles
 
     def show_post_processing_options(self):
-        """Show options after processing the image."""
-        # Remove the process/next buttons
         self.continue_button.pack_forget()
         self.next_button.pack_forget()
-
-        # Add save/edit buttons to the existing button_frame
         self.save_button = ttk.Button(self.button_frame, text="Save", command=self.on_save)
         self.edit_button = ttk.Button(self.button_frame, text="Edit", command=self.on_edit)
         self.save_button.pack(side=tk.LEFT, padx=5)
         self.edit_button.pack(side=tk.RIGHT, padx=5)
 
-
     def on_save(self):
-        """Save the processed image locally, but do not upload."""
         try:
             final_path = os.path.join(self.final_dir, self.current_image_info['name'])
             processed_path = os.path.join(self.processed_dir, self.current_image_info['name'])
-            
             if os.path.exists(processed_path):
                 image = cv2.imread(processed_path)
-                
                 for rect in self.rectangles:
                     x1, y1, x2, y2, class_name = rect
                     color = self.feature_colors.get(class_name, (0, 255, 0))
                     cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
                     cv2.putText(image, class_name, (x1, y1-10), 
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
-                
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
                 cv2.imwrite(final_path, image)
                 self.update_coordinates_file()
-                print(f"Saved processed image with {len(self.rectangles)} rectangles: {final_path}")
                 self.image_processed = True
-                
                 messagebox.showinfo("Success", "Image saved locally. Click 'Next Image' to upload to cloud.")
                 self.setup_initial_ui()
-                self.display_image(processed_path)  # Redisplay current image without resetting rectangles
+                self.display_image(processed_path)
             else:
-                print(f"Processed image not found: {processed_path}")
                 messagebox.showerror("Error", "No processed image found. Please process the image first.")
-        
         except Exception as e:
-            print(f"Save failed: {str(e)}")
             messagebox.showerror("Error", f"Save failed: {str(e)}")
 
-
     def finalize_and_upload(self):
-        """Upload the final image and single coordinates file to Google Drive."""
         try:
             if not self.image_processed:
-                print(f"Skipping upload for {self.current_image_info['name']}: Image not processed")
                 messagebox.showwarning("Warning", "Image not processed. Please process and save before uploading.")
                 return
-            
-            # Ensure the coordinates file is up-to-date
             self.update_coordinates_file()
-            
             final_path = os.path.join(self.final_dir, self.current_image_info['name'])
             coord_file = os.path.join(self.coords_dir, f"{os.path.splitext(self.current_image_info['name'])[0]}_coords.txt")
-            
             if not os.path.exists(final_path):
-                print(f"Final image not found: {final_path}")
                 messagebox.showerror("Error", f"Final image not found: {self.current_image_info['name']}. Please save the image first.")
                 return
-            
             if not os.path.exists(coord_file):
-                print(f"Coordinates file not found: {coord_file}. Creating empty file.")
                 with open(coord_file, "w") as f:
                     pass
-            
-            print(f"Final dir contents: {os.listdir(self.final_dir)}")
-            print(f"Coords dir contents: {os.listdir(self.coords_dir)}")
-            
             user_folder_id = self.create_or_get_user_folder()
             mouse_name = self.current_image_info['gene']
             mouse_folder_id = self.create_or_get_mouse_folder(mouse_name, user_folder_id)
-            print(f"Uploading to folder: {self.user_name}/{mouse_name} (ID: {mouse_folder_id})")
-            
-            print(f"Uploading image: {final_path}")
             if not self.upload_to_drive(final_path, self.current_image_info['name'], mouse_folder_id):
-                print(f"Failed to upload image: {final_path}")
                 return
-            
-            print(f"Uploading coordinates: {coord_file}")
             if not self.upload_to_drive(coord_file, os.path.basename(coord_file), mouse_folder_id):
-                print(f"Failed to upload coordinates: {coord_file}")
                 return
-            
-            # messagebox.showinfo("Success", f"Uploaded {self.current_image_info['name']} and coordinates to {self.user_name}/{mouse_name}")
             self.image_processed = False
-            
         except Exception as e:
-            print(f"Upload failed: {str(e)}")
             messagebox.showerror("Error", f"Failed to upload to cloud: {str(e)}")
 
     def load_next_image(self):
-        """Load the next image and upload the previous image's files if processed."""
         if self.current_image_info:
-            print(f"Processing upload for image: {self.current_image_info['name']}")
             self.finalize_and_upload()
-        
         self.image_index += 1
         self.image_processed = False
-        self.rectangles = []  # Reset after upload
-        
+        self.rectangles = []
         if self.image_index >= len(self.image_list):
             messagebox.showinfo("Complete", "All images processed!")
             self.root.quit()
             return
-        
         self.save_state()
         self.load_image()
 
     def verify_folder_structure(self):
-        """Debug method to verify folder structure exists"""
         try:
-            # Check user folder exists
             user_query = f"'{self.output_folder_id}' in parents and name='{self.user_name}' and mimeType='application/vnd.google-apps.folder'"
             user_folders = self.drive_service.files().list(q=user_query).execute().get('files', [])
-            
             if not user_folders:
-                print(f"User folder not found: {self.user_name}")
                 return False
-                
-            # Check for at least one mouse folder
             mouse_query = f"'{user_folders[0]['id']}' in parents and mimeType='application/vnd.google-apps.folder'"
             mouse_folders = self.drive_service.files().list(q=mouse_query).execute().get('files', [])
-            
-            print(f"Found {len(mouse_folders)} mouse folders for user {self.user_name}")
             return True
-            
         except Exception as e:
-            print(f"Verification failed: {str(e)}")
             return False
-    
+
     def create_or_get_user_folder(self):
-        """Create or get user-specific folder in the root output directory"""
         try:
-            # Query for existing user folder
             query = f"name='{self.user_name}' and '{self.output_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
             existing = self.drive_service.files().list(q=query, fields="files(id)").execute().get('files', [])
-            
             if existing:
                 return existing[0]['id']
-            
-            # Create new user folder
             folder_metadata = {
                 'name': self.user_name,
                 'mimeType': 'application/vnd.google-apps.folder',
@@ -819,22 +549,16 @@ class CloudImageApp:
             }
             folder = self.drive_service.files().create(body=folder_metadata, fields='id').execute()
             return folder['id']
-        
         except Exception as e:
             messagebox.showerror("Error", f"Failed to create user folder: {str(e)}")
             raise
 
     def create_or_get_mouse_folder(self, mouse_name, parent_folder_id):
-        """Create or get mouse-specific folder within user folder"""
         try:
-            # Query for existing mouse folder
             query = f"name='{mouse_name}' and '{parent_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
             existing = self.drive_service.files().list(q=query, fields="files(id)").execute().get('files', [])
-            
             if existing:
                 return existing[0]['id']
-            
-            # Create new mouse folder
             folder_metadata = {
                 'name': mouse_name,
                 'mimeType': 'application/vnd.google-apps.folder',
@@ -842,47 +566,30 @@ class CloudImageApp:
             }
             folder = self.drive_service.files().create(body=folder_metadata, fields='id').execute()
             return folder['id']
-        
         except Exception as e:
             messagebox.showerror("Error", f"Failed to create mouse folder: {str(e)}")
             raise
 
     def on_edit(self):
-        """Handle edit button click"""
-        # Check if processed image exists
         processed_path = os.path.join(self.processed_dir, self.current_image_info['name'])
-        
         if not os.path.exists(processed_path):
-            # If not processed, use the original image as starting point
             original_path = os.path.join(self.temp_dir, self.current_image_info['name'])
             if os.path.exists(original_path):
-                # Copy original to processed directory to work with
                 shutil.copy2(original_path, processed_path)
-        
         self.enter_edit_mode()
 
     def enter_edit_mode(self):
-        """Enter edit mode for the current image."""
         self.setup_edit_ui()
-        
-        # Try to load the processed image first, fall back to original if needed
         processed_path = os.path.join(self.processed_dir, self.current_image_info['name'])
         image_path = processed_path if os.path.exists(processed_path) else os.path.join(self.temp_dir, self.current_image_info['name'])
-        
         if os.path.exists(image_path):
             self.current_image = cv2.imread(image_path)
-            
-            # Convert and display the image
             image_pil = Image.open(image_path).resize((1280, 512))
             self.image_tk_edit = ImageTk.PhotoImage(image_pil)
             self.canvas_image = self.edit_canvas.create_image(0, 0, anchor=tk.NW, image=self.image_tk_edit)
-            
-            # Load any existing coordinates
             coord_file = os.path.join(self.coords_dir, f"{os.path.splitext(self.current_image_info['name'])[0]}_coords.txt")
             if os.path.exists(coord_file):
                 self.rectangles = self.load_coordinates(self.current_image_info['name'])
-            
-            # Bind mouse events
             self.edit_canvas.bind("<ButtonPress-1>", self.on_drag_start)
             self.edit_canvas.bind("<B1-Motion>", self.on_drag_move)
             self.edit_canvas.bind("<ButtonRelease-1>", self.on_drag_end)
@@ -890,9 +597,7 @@ class CloudImageApp:
             messagebox.showerror("Error", "Image not found")
             self.setup_initial_ui()
 
-
     def on_drag_start(self, event):
-        """Handle the start of dragging."""
         if self.mode.get() == "Add":
             self.start_x, self.start_y = event.x, event.y
             self.rect_id = None
@@ -901,7 +606,6 @@ class CloudImageApp:
             self.remove_rectangle(x, y)
 
     def on_drag_move(self, event):
-        """Handle dragging motion."""
         if self.mode.get() == "Add":
             if self.rect_id:
                 self.edit_canvas.delete(self.rect_id)
@@ -911,63 +615,47 @@ class CloudImageApp:
             )
 
     def on_drag_end(self, event):
-        """Handle the end of dragging."""
         if self.mode.get() == "Add":
             canvas_width = 1280
             canvas_height = 512
             image = cv2.imread(os.path.join(self.processed_dir, self.current_image_info['name']))
             original_height, original_width = image.shape[:2]
-
             scale_x = original_width / canvas_width
             scale_y = original_height / canvas_height
-
             scaled_start_x = int(self.start_x * scale_x)
             scaled_start_y = int(self.start_y * scale_y)
             scaled_end_x = int(event.x * scale_x)
             scaled_end_y = int(event.y * scale_y)
-
             for rect in self.rectangles:
                 x1, y1, x2, y2, _ = rect
                 if x1 == scaled_start_x and y1 == scaled_start_y and x2 == scaled_end_x and y2 == scaled_end_y:
                     return
-
             self.save_rectangle(scaled_start_x, scaled_start_y, scaled_end_x, scaled_end_y)
             self.redraw_image()
 
     def save_rectangle(self, x1, y1, x2, y2):
-        """Save a rectangle with the currently selected feature type."""
         class_name = self.feature_type.get()
-        # Check for duplicate rectangles
         new_rect = (x1, y1, x2, y2, class_name)
         if new_rect not in self.rectangles:
             self.rectangles.append(new_rect)
-            print(f"Added rectangle: {new_rect}")
-        else:
-            print(f"Skipped duplicate rectangle: {new_rect}")
         self.update_coordinates_file()
         self.redraw_image()
 
     def remove_rectangle(self, x, y):
-        """Remove a rectangle from the list."""
         canvas_width = 1280
         canvas_height = 512
         image = cv2.imread(os.path.join(self.processed_dir, self.current_image_info['name']))
         original_height, original_width = image.shape[:2]
-
         scale_x = original_width / canvas_width
         scale_y = original_height / canvas_height
-
         scaled_x = int(x * scale_x)
         scaled_y = int(y * scale_y)
-
-        for rect in self.rectangles[:]:  # Iterate over a copy to safely remove
+        for rect in self.rectangles[:]:
             x1, y1, x2, y2, _ = rect
             if x1 <= scaled_x <= x2 and y1 <= scaled_y <= y2:
                 self.rectangles.remove(rect)
-                print(f"Removed rectangle: {rect}")
                 self.update_coordinates_file()
                 self.redraw_image()
-
                 line_thickness = 2
                 line_length = 10
                 color = (0, 0, 255)
@@ -975,30 +663,23 @@ class CloudImageApp:
                          (scaled_x + line_length, scaled_y + line_length), color, thickness=line_thickness)
                 cv2.line(image, (scaled_x - line_length, scaled_y + line_length),
                          (scaled_x + line_length, scaled_y - line_length), color, thickness=line_thickness)
-
                 updated_image_path = os.path.join(self.processed_dir, self.current_image_info['name'])
                 cv2.imwrite(updated_image_path, image)
-
                 updated_image = Image.open(updated_image_path).resize((1280, 512))
                 self.image_tk_edit = ImageTk.PhotoImage(updated_image)
                 self.edit_canvas.itemconfig(self.canvas_image, image=self.image_tk_edit)
                 return
 
     def redraw_image(self):
-        """Redraw the image with rectangles colored by feature type."""
         base_image_path = os.path.join(self.processed_dir, self.current_image_info['name'])
         image = cv2.imread(base_image_path)
-
         for rect in self.rectangles:
             x1, y1, x2, y2, class_name = rect
-            color = self.feature_colors.get(class_name, (0, 255, 0))  # Default to green
+            color = self.feature_colors.get(class_name, (0, 255, 0))
             cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
-
-            # Add class label
             label = f"{class_name}"
             cv2.putText(image, label, (x1, y1 - 20), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
-
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
         updated_image_path = os.path.join(self.processed_dir, self.current_image_info['name'])
         cv2.imwrite(updated_image_path, image)
         updated_image = Image.open(updated_image_path).resize((1280, 512))
@@ -1006,68 +687,16 @@ class CloudImageApp:
         self.edit_canvas.itemconfig(self.canvas_image, image=self.image_tk_edit)
 
     def update_mode(self):
-        """Update the mode (Add/Remove)."""
         if self.mode.get() == "Add":
             self.edit_canvas.config(cursor="arrow")
         elif self.mode.get() == "Remove":
             self.edit_canvas.config(cursor="crosshair")
 
-    def finalize_and_upload(self):
-        """Upload the final image and single coordinates file to Google Drive."""
-        try:
-            if not self.image_processed:
-                print(f"Skipping upload for {self.current_image_info['name']}: Image not processed")
-                messagebox.showwarning("Warning", "Image not processed. Please process and save before uploading.")
-                return
-            
-            self.update_coordinates_file()
-            
-            final_path = os.path.join(self.final_dir, self.current_image_info['name'])
-            coord_file = os.path.join(self.coords_dir, f"{os.path.splitext(self.current_image_info['name'])[0]}_coords.txt")
-            
-            if not os.path.exists(final_path):
-                print(f"Final image not found: {final_path}")
-                messagebox.showerror("Error", f"Final image not found: {self.current_image_info['name']}. Please save the image first.")
-                return
-            
-            if not os.path.exists(coord_file):
-                print(f"Coordinates file not found: {coord_file}. Creating empty file.")
-                with open(coord_file, "w") as f:
-                    pass
-            
-            print(f"Final dir contents: {os.listdir(self.final_dir)}")
-            print(f"Coords dir contents: {os.listdir(self.coords_dir)}")
-            
-            user_folder_id = self.create_or_get_user_folder()
-            mouse_name = self.current_image_info['gene']
-            mouse_folder_id = self.create_or_get_mouse_folder(mouse_name, user_folder_id)
-            print(f"Uploading to folder: {self.user_name}/{mouse_name} (ID: {mouse_folder_id})")
-            
-            print(f"Uploading image: {final_path}")
-            if not self.upload_to_drive(final_path, self.current_image_info['name'], mouse_folder_id):
-                print(f"Failed to upload image: {final_path}")
-                return
-            
-            print(f"Uploading coordinates: {coord_file}")
-            if not self.upload_to_drive(coord_file, os.path.basename(coord_file), mouse_folder_id):
-                print(f"Failed to upload coordinates: {coord_file}")
-                return
-            
-            # messagebox.showinfo("Success", f"Uploaded {self.current_image_info['name']} and coordinates to {self.user_name}/{mouse_name}")
-            self.image_processed = False
-            
-        except Exception as e:
-            print(f"Upload failed: {str(e)}")
-            messagebox.showerror("Error", f"Failed to upload to cloud: {str(e)}")
-
-
     def clear_edit_widgets(self):
-        """Safely remove edit mode widgets."""
         widgets_to_remove = [
             'mode_label_name', 'mode_label', 'add_radio', 
             'remove_radio', 'edit_canvas', 'finalize_button'
         ]
-        
         for widget_name in widgets_to_remove:
             if hasattr(self, widget_name):
                 widget = getattr(self, widget_name)
@@ -1075,85 +704,14 @@ class CloudImageApp:
                     widget.pack_forget()
                     widget.destroy()
                 except tk.TclError:
-                    pass  # Widget might already be destroyed
+                    pass
                 except Exception as e:
-                    print(f"Error removing widget {widget_name}: {str(e)}")
+                    pass
                 finally:
                     if hasattr(self, widget_name):
                         delattr(self, widget_name)
 
-
-    def reset_to_initial_page(self):
-        """Reset the UI to the initial state."""
-        # First ensure all edit widgets are cleared
-        self.clear_edit_widgets()
-        
-        # Make sure basic widgets exist
-        if not hasattr(self, 'image_label'):
-            self.image_label = tk.Label(self.root)
-            self.image_label.pack(pady=10)
-        
-        if not hasattr(self, 'button_frame'):
-            self.button_frame = tk.Frame(self.root)
-            self.button_frame.pack(pady=5)
-        
-        # Recreate buttons if needed
-        if not hasattr(self, 'continue_button'):
-            self.continue_button = tk.Button(self.button_frame, text="Process", command=self.on_continue)
-            self.continue_button.pack(side=tk.LEFT, padx=5)
-        
-        if not hasattr(self, 'next_button'):
-            self.next_button = tk.Button(self.button_frame, text="Next Image", command=self.load_next_image)
-            self.next_button.pack(side=tk.RIGHT, padx=5)
-        
-        # Redisplay the image
-        self.load_image()
-
-    def reset_to_initial_page(self):
-        """Reset the UI to the initial state."""
-        # Only remove the edit-specific widgets
-        if hasattr(self, 'mode_label_name'):
-            self.mode_label_name.pack_forget()
-        if hasattr(self, 'mode_label'):
-            self.mode_label.pack_forget()
-        if hasattr(self, 'add_radio'):
-            self.add_radio.pack_forget()
-        if hasattr(self, 'remove_radio'):
-            self.remove_radio.pack_forget()
-        if hasattr(self, 'edit_canvas'):
-            self.edit_canvas.pack_forget()
-        if hasattr(self, 'finalize_button'):
-            self.finalize_button.pack_forget()
-
-        # Show the original buttons
-        self.continue_button.pack(side=tk.LEFT, padx=5)
-        self.next_button.pack(side=tk.RIGHT, padx=5)
-        
-        self.load_next_image()
-
-    def load_next_image(self):
-        """Load the next image and upload the previous image's files if processed."""
-        # Upload the current image's files if it was processed
-        if self.current_image_info:
-            print(f"Processing upload for image: {self.current_image_info['name']}")
-            self.finalize_and_upload()
-        else:
-            print("No current image to upload")
-        
-        self.image_index += 1
-        self.image_processed = False  # Reset for the next image
-        self.rectangles = []  # Clear rectangles for the next image
-        
-        if self.image_index >= len(self.image_list):
-            messagebox.showinfo("Complete", "All images processed!")
-            self.root.quit()
-            return
-        
-        self.save_state()
-        self.load_image()
-
     def cleanup(self):
-        """Clean up temporary files."""
         try:
             for root_dir, dirs, files in os.walk(self.temp_dir, topdown=False):
                 for name in files:
@@ -1162,441 +720,380 @@ class CloudImageApp:
                     os.rmdir(os.path.join(root_dir, name))
             os.rmdir(self.temp_dir)
         except Exception as e:
-            print(f"Cleanup error: {str(e)}")
+            pass
 
     def on_close(self):
-        """Handle application close without uploading."""
-        print("Closing application, no upload performed")
         self.save_state()
         self.cleanup()
         self.root.quit()
 
-
-
-    def add_variability_plot_button(self):
-        """Add the variability plot button to the UI."""
-        self.variability_button = ttk.Button(
-            self.button_frame, 
-            text="Inter-Observer Variability Plot", 
-            command=self.generate_variability_plots
-        )
-        self.variability_button.pack(side=tk.LEFT, padx=5)
-
     def generate_variability_plots(self):
-        """Generate inter-observer variability plots from Google Drive data and display in a new window."""
         try:
-            # Create a temporary directory for processing
             temp_dir = tempfile.mkdtemp()
-            
-            # Step 1: Get all observers from the output folder
             observers = self.get_observers_from_drive()
-            
             if len(observers) < 2:
                 messagebox.showinfo(
                     "Info", 
                     f"Need at least 2 observers for comparison. Found {len(observers)} observer(s)."
                 )
                 return
-                
-            # Step 2: Find common images that all observers have processed
             common_images = self.find_common_images(observers)
-            
             if len(common_images) < self.interobplt_thresh:
                 messagebox.showinfo(
                     "Info", 
                     f"Need at least {self.interobplt_thresh} common images for comparison. Found {len(common_images)} common images."
                 )
                 return
-                
-            # Step 3: Download and process the data
             self.process_observer_data(observers, common_images, temp_dir)
-            
-            # Step 4: Generate the plots and collect PNG paths
             image_files = self.generate_visualizations(temp_dir)
-            
-            # Step 5: Display plots in a new window
             self.display_plots_window(image_files)
-            
             messagebox.showinfo(
                 "Success", 
                 f"Generated variability plots for {len(observers)} observers and {len(common_images)} common images."
             )
-            
         except Exception as e:
             messagebox.showerror("Error", f"Failed to generate plots: {str(e)}")
         finally:
-            # Clean up temporary files
             if os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir)
 
     def get_observers_from_drive(self):
-        """Get list of observers from the output folder."""
         try:
-            # Query for all folders in the output folder (each folder is an observer)
             query = f"'{self.output_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
             folders = self.drive_service.files().list(
                 q=query, 
                 fields="files(name,id)"
             ).execute().get('files', [])
-            
             return [folder['name'] for folder in folders]
-            
         except Exception as e:
-            print(f"Error getting observers: {str(e)}")
             return []
 
     def find_common_images(self, observers):
-        """Find images that all observers have processed."""
         try:
-            # Get the list of mouse folders for each observer
             observer_mice = {}
             for observer in observers:
-                # Get observer folder ID
                 query = f"name='{observer}' and '{self.output_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
                 observer_folder = self.drive_service.files().list(
                     q=query, 
                     fields="files(id)"
                 ).execute().get('files', [])
-                
                 if not observer_folder:
                     continue
-                    
                 observer_folder_id = observer_folder[0]['id']
-                
-                # Get all mouse folders for this observer
                 query = f"'{observer_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
                 mouse_folders = self.drive_service.files().list(
                     q=query, 
                     fields="files(name)"
                 ).execute().get('files', [])
-                
                 observer_mice[observer] = {mf['name'] for mf in mouse_folders}
-            
-            # Find common mice across all observers
             common_mice = set.intersection(*observer_mice.values())
-            
-            # Now find images that exist for all observers in these common mice
             common_images = []
-            
             for mouse in common_mice:
-                # Get images for first observer as reference
                 first_observer = observers[0]
                 query = f"name='{first_observer}' and '{self.output_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
                 first_observer_folder = self.drive_service.files().list(
                     q=query, 
                     fields="files(id)"
                 ).execute().get('files', [])
-                
                 if not first_observer_folder:
                     continue
-                    
                 first_observer_folder_id = first_observer_folder[0]['id']
-                
                 query = f"name='{mouse}' and '{first_observer_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
                 mouse_folder = self.drive_service.files().list(
                     q=query, 
                     fields="files(id)"
                 ).execute().get('files', [])
-                
                 if not mouse_folder:
                     continue
-                    
                 mouse_folder_id = mouse_folder[0]['id']
-                
-                # Get all images for this mouse from first observer
                 query = f"'{mouse_folder_id}' in parents and mimeType!='application/vnd.google-apps.folder' and trashed=false"
                 images = self.drive_service.files().list(
                     q=query, 
                     fields="files(name)"
                 ).execute().get('files', [])
-                
-                # Check if these images exist for all other observers
                 for image in images:
                     image_name = image['name']
                     if image_name.lower().endswith(('.png', '.jpg', '.jpeg')):
-                        # Check if all other observers have this image
                         all_have = True
                         for observer in observers[1:]:
                             if not self.image_exists_for_observer(observer, mouse, image_name):
                                 all_have = False
                                 break
-                                
                         if all_have:
                             common_images.append((mouse, image_name))
-                            
             return common_images
-            
         except Exception as e:
-            print(f"Error finding common images: {str(e)}")
             return []
 
     def image_exists_for_observer(self, observer, mouse, image_name):
-        """Check if an image exists for a specific observer and mouse."""
         try:
-            # Get observer folder
             query = f"name='{observer}' and '{self.output_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
             observer_folder = self.drive_service.files().list(
                 q=query, 
                 fields="files(id)"
             ).execute().get('files', [])
-            
             if not observer_folder:
                 return False
-                
             observer_folder_id = observer_folder[0]['id']
-            
-            # Get mouse folder
             query = f"name='{mouse}' and '{observer_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
             mouse_folder = self.drive_service.files().list(
                 q=query, 
                 fields="files(id)"
             ).execute().get('files', [])
-            
             if not mouse_folder:
                 return False
-                
             mouse_folder_id = mouse_folder[0]['id']
-            
-            # Check if image exists
             query = f"name='{image_name}' and '{mouse_folder_id}' in parents and trashed=false"
             images = self.drive_service.files().list(
                 q=query, 
                 fields="files(id)"
             ).execute().get('files', [])
-            
             return len(images) > 0
-            
         except Exception as e:
-            print(f"Error checking image existence: {str(e)}")
             return False
 
     def process_observer_data(self, observers, common_images, temp_dir):
-        """Download and process data from all observers."""
         try:
-            # Create directories for each observer
             observer_dirs = {}
             for observer in observers:
                 observer_dir = os.path.join(temp_dir, observer)
                 os.makedirs(observer_dir, exist_ok=True)
                 observer_dirs[observer] = observer_dir
-                
-            # Download data for each common image
             for mouse, image_name in common_images:
                 for observer in observers:
-                    # Get the image file
                     image_path = os.path.join(observer_dirs[observer], image_name)
                     coord_file = os.path.splitext(image_name)[0] + "_coords.txt"
                     coord_path = os.path.join(observer_dirs[observer], coord_file)
-                    
-                    # Download the image and coordinates
                     self.download_observer_files(observer, mouse, image_name, image_path, coord_path)
-                    
         except Exception as e:
-            print(f"Error processing observer data: {str(e)}")
             raise
 
     def download_observer_files(self, observer, mouse, image_name, image_path, coord_path):
-        """Download image and coordinates file for an observer."""
         try:
-            # Get observer folder
             query = f"name='{observer}' and '{self.output_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
             observer_folder = self.drive_service.files().list(
                 q=query, 
                 fields="files(id)"
             ).execute().get('files', [])
-            
             if not observer_folder:
                 raise FileNotFoundError(f"Observer folder not found: {observer}")
-                
             observer_folder_id = observer_folder[0]['id']
-            
-            # Get mouse folder
             query = f"name='{mouse}' and '{observer_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
             mouse_folder = self.drive_service.files().list(
                 q=query, 
                 fields="files(id)"
             ).execute().get('files', [])
-            
             if not mouse_folder:
                 raise FileNotFoundError(f"Mouse folder not found: {mouse}")
-                
             mouse_folder_id = mouse_folder[0]['id']
-            
-            # Download image
             query = f"name='{image_name}' and '{mouse_folder_id}' in parents and trashed=false"
             image_files = self.drive_service.files().list(
                 q=query, 
                 fields="files(id)"
             ).execute().get('files', [])
-            
             if not image_files:
                 raise FileNotFoundError(f"Image not found: {image_name}")
-                
             self.download_from_drive(image_files[0]['id'], image_path)
-            
-            # Download coordinates file
             coord_name = os.path.splitext(image_name)[0] + "_coords.txt"
             query = f"name='{coord_name}' and '{mouse_folder_id}' in parents and trashed=false"
             coord_files = self.drive_service.files().list(
                 q=query, 
                 fields="files(id)"
             ).execute().get('files', [])
-            
-            if coord_files:  # Coordinates file is optional
+            if coord_files:
                 self.download_from_drive(coord_files[0]['id'], coord_path)
-                
         except Exception as e:
-            print(f"Error downloading files for {observer}/{mouse}/{image_name}: {str(e)}")
             raise
 
+    def calculate_iou(self, box1, box2):
+        x1, y1, x2, y2 = box1
+        x1_b, y1_b, x2_b, y2_b = box2
+
+        xi1 = max(x1, x1_b)
+        yi1 = max(y1, y1_b)
+        xi2 = min(x2, x2_b)
+        yi2 = min(y2, y2_b)
+
+        # Calculate intersection area
+        inter_width = max(0, xi2 - xi1)
+        inter_height = max(0, yi2 - yi1)
+        inter_area = inter_width * inter_height
+
+        # Calculate areas of both boxes
+        box1_area = (x2 - x1) * (y2 - y1)
+        box2_area = (x2_b - x1_b) * (y2_b - y1_b)
+
+        # Calculate union area
+        union_area = box1_area + box2_area - inter_area
+
+        # Avoid division by zero
+        if union_area == 0:
+            return 0.0
+
+        return inter_area / union_area
+
     def generate_visualizations(self, temp_dir):
-        """Generate the inter-observer variability plots and return list of PNG file paths."""
         try:
-            # Create directories for output
-            summary_dir = os.path.join(temp_dir, "summary")
             viz_dir = os.path.join(temp_dir, "visualizations")
-            os.makedirs(summary_dir, exist_ok=True)
             os.makedirs(viz_dir, exist_ok=True)
-            
-            # Get all observers
-            observers = [d for d in os.listdir(temp_dir) if os.path.isdir(os.path.join(temp_dir, d))]
-            
+            # Exclude 'visualizations' directory from observers
+            observers = [
+                d for d in os.listdir(temp_dir)
+                if os.path.isdir(os.path.join(temp_dir, d)) and d != "visualizations"
+            ]
             if len(observers) < 2:
                 raise ValueError("Need at least 2 observers for comparison")
-                
-            # Class mapping
             class_mapping = {
                 "Neutrophils": 0,
                 "Hyaline Membranes": 1,
                 "Proteinaceous Debris": 2
             }
-            
-            # Color mapping
             color_mapping = {
                 observers[0]: "#2D6A4F",
                 "Common": "#F4D35E",
                 observers[1]: "#84C5A1"
             }
-            
-            # List to store PNG file paths
             image_files = []
-            
-            # For each mouse condition, generate summary and plots
             mouse_conditions = set()
-            
-            # First find all mouse conditions
             for observer in observers:
                 observer_dir = os.path.join(temp_dir, observer)
                 for file in os.listdir(observer_dir):
                     if file.endswith('_coords.txt'):
-                        mouse = file.split('_')[0]  # Assuming format: MouseX_..._coords.txt
+                        mouse = file.split('_')[0]
                         mouse_conditions.add(mouse)
-            
-            # Process each mouse condition
+
             for mouse in mouse_conditions:
-                # Process each feature
                 for feature in class_mapping.keys():
-                    # Create a summary dataframe
-                    summary_data = []
-                    
-                    # Get all images for this mouse
+                    plot_data = []
                     image_files_list = []
                     for observer in observers:
                         observer_dir = os.path.join(temp_dir, observer)
                         for file in os.listdir(observer_dir):
                             if file.startswith(mouse) and file.endswith('_coords.txt'):
                                 image_files_list.append(file)
-                    
-                    # For each image, count features for each observer
-                    for coord_file in set(image_files_list):  # Use set to avoid duplicates
+
+                    for coord_file in set(image_files_list):
                         image_name = coord_file.replace('_coords.txt', '')
-                        counts = {observer: 0 for observer in observers}
-                        
-                        # Count features for each observer
+                        # Load bounding boxes for each observer
+                        observer_boxes = {}
                         for observer in observers:
                             coord_path = os.path.join(temp_dir, observer, coord_file)
+                            boxes = []
                             if os.path.exists(coord_path):
                                 with open(coord_path, 'r') as f:
                                     for line in f:
                                         parts = line.strip().split(',')
                                         if len(parts) >= 5 and parts[4] == feature:
-                                            counts[observer] += 1
-                        
-                        summary_data.append({
+                                            x1, y1, x2, y2 = map(int, parts[:4])
+                                            boxes.append([x1, y1, x2, y2])
+                            observer_boxes[observer] = boxes
+
+                        # Calculate "Common" using IoU-based intersection across all observers
+                        if not all(observer_boxes[obs] for obs in observers):
+                            common_count = 0  # If any observer has no boxes, common is 0
+                        else:
+                            # Start with the first observer's boxes
+                            common_boxes = observer_boxes[observers[0]].copy()
+                            matched_indices = {obs: [False] * len(observer_boxes[obs]) for obs in observers}
+
+                            # Iteratively intersect with each subsequent observer
+                            for i in range(1, len(observers)):
+                                current_observer = observers[i]
+                                new_common_boxes = []
+                                matched_indices[current_observer] = [False] * len(observer_boxes[current_observer])
+
+                                for box1 in common_boxes:
+                                    best_iou = 0.1  # IoU threshold
+                                    best_match = None
+                                    best_idx = None
+
+                                    for j, box2 in enumerate(observer_boxes[current_observer]):
+                                        if not matched_indices[current_observer][j]:
+                                            iou = self.calculate_iou(box1, box2)
+                                            if iou > best_iou:
+                                                best_iou = iou
+                                                best_match = box2
+                                                best_idx = j
+
+                                    if best_match:
+                                        # Average the coordinates to create an intersection box
+                                        avg_box = [
+                                            (box1[0] + best_match[0]) / 2,
+                                            (box1[1] + best_match[1]) / 2,
+                                            (box1[2] + best_match[2]) / 2,
+                                            (box1[3] + best_match[3]) / 2
+                                        ]
+                                        new_common_boxes.append(avg_box)
+                                        matched_indices[current_observer][best_idx] = True
+
+                                common_boxes = new_common_boxes
+
+                            common_count = len(common_boxes)
+
+                        # Count individual observer annotations
+                        counts = {observer: len(observer_boxes[observer]) for observer in observers}
+                        # Debug: Log counts and common
+                        print(f"Image: {image_name}, Feature: {feature}, Counts: {counts}, Common: {common_count}")
+                        plot_data.append({
                             'Image': image_name,
-                            **counts
+                            **counts,
+                            'Common': common_count
                         })
-                    
-                    # Create dataframe
-                    df = pd.DataFrame(summary_data)
-                    
-                    # Calculate common counts (minimum count across observers)
-                    df['Common'] = df[observers].min(axis=1)
-                    
-                    # Subtract common counts from each observer's count
-                    for observer in observers:
-                        df[observer] = df[observer] - df['Common']
-                    
-                    # Save summary CSV
-                    summary_file = os.path.join(summary_dir, f"label_summary_{mouse}_{feature.replace(' ', '_')}.csv")
-                    df.to_csv(summary_file, index=False)
-                    
-                    # Generate visualization and store PNG path
+
+                    df = pd.DataFrame(plot_data)
+                    # Debug: Check if Common is zero
+                    if df['Common'].sum() == 0:
+                        print(f"Warning: No common annotations for {feature} in {mouse}. Check coordinate files.")
                     image_path = self.create_variability_plot(
                         df, mouse, feature, observers, color_mapping, viz_dir
                     )
                     image_files.append((feature, image_path))
-            
             return image_files
-            
         except Exception as e:
-            print(f"Error generating visualizations: {str(e)}")
-            raise
-
+            raise Exception(f"Failed to generate visualizations: {str(e)}")
+    
     def create_variability_plot(self, df, mouse, feature, observers, color_mapping, viz_dir):
-        """Create a single variability plot and return the PNG file path."""
         try:
-            # Calculate percentages
+            # Normalize so each bar totals 100%
             df['Total'] = df[observers].sum(axis=1) + df['Common']
             for observer in observers:
                 df[observer] = (df[observer] / df['Total']) * 100
             df['Common'] = (df['Common'] / df['Total']) * 100
-            
-            # Sort by first observer's percentage
             df = df.sort_values(by=observers[0], ascending=False)
             df['index'] = range(len(df))
-            
-            # Create the plot
             fig = go.Figure()
-            
-            # Add bars for each observer
+            # Plot first observer
             fig.add_trace(go.Bar(
                 x=df['index'],
                 y=df[observers[0]],
                 name=f"<b>{observers[0]}</b>",
-                marker_color=color_mapping[observers[0]]
+                marker_color=color_mapping[observers[0]],
+                text=df[observers[0]].round(1).astype(str) + '%',
+                textposition='inside'
             ))
-            
+            # Plot Common
             fig.add_trace(go.Bar(
                 x=df['index'],
                 y=df["Common"],
                 name="<b>Common</b>",
                 marker_color=color_mapping["Common"],
-                base=df[observers[0]]
+                base=df[observers[0]],
+                text=df["Common"].round(1).astype(str) + '%',
+                textposition='inside'
             ))
-            
+            # Plot remaining observers
             for i, observer in enumerate(observers[1:], 1):
-                base = df[observers[:i]].sum(axis=1) + df['Common']
+                base = df[[observers[0], "Common"]].sum(axis=1) if i == 1 else df[observers[:i] + ["Common"]].sum(axis=1)
                 fig.add_trace(go.Bar(
                     x=df['index'],
                     y=df[observer],
                     name=f"<b>{observer}</b>",
                     marker_color=color_mapping.get(observer, f"hsl({i*60},50%,50%)"),
-                    base=base
+                    base=base,
+                    text=df[observer].round(1).astype(str) + '%',
+                    textposition='inside'
                 ))
-            
             title = f"<b>Inter-Observer Variability of {feature} Counts in {mouse} Tiles</b>"
-            
             fig.update_layout(
                 barmode='stack',
                 title=title,
@@ -1607,55 +1104,35 @@ class CloudImageApp:
                     tick0=1,
                     dtick=2
                 ),
-                legend_title="<b>Categories</b>",
-                yaxis=dict(range=[0,100]),
+                legend_title="<b>Observers</b>",
+                yaxis=dict(range=[0, 100]),
                 width=1200,
                 height=600
             )
-            
-            # Save the visualization as PNG
             viz_filename = f"inter_observer_{mouse}_{feature.replace(' ', '_')}.png"
             viz_path = os.path.join(viz_dir, viz_filename)
             fig.write_image(viz_path, format="png")
-            
             return viz_path
-            
         except Exception as e:
-            print(f"Error creating plot for {mouse} {feature}: {str(e)}")
-            raise
+            raise Exception(f"Failed to create variability plot: {str(e)}")
 
     def display_plots_window(self, image_files):
-        """Display all variability plots in a new Tkinter window."""
         try:
-            # Create a new top-level window
             plot_window = tk.Toplevel(self.root)
             plot_window.title("Inter-Observer Variability Plots")
             plot_window.geometry("1280x800")
-            
-            # Create a notebook for tabbed interface
             notebook = ttk.Notebook(plot_window)
             notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-            
-            # Add each PNG plot to a separate tab
             for feature, image_path in image_files:
-                # Create a frame for this tab
                 tab_frame = ttk.Frame(notebook)
                 notebook.add(tab_frame, text=feature)
-                
-                # Load and display the image
                 image = Image.open(image_path)
-                # Resize to fit window if necessary, maintaining aspect ratio
                 image = image.resize((1200, 600), Image.LANCZOS)
                 photo = ImageTk.PhotoImage(image)
-                
-                # Create a label to display the image
                 image_label = ttk.Label(tab_frame, image=photo)
-                image_label.image = photo  # Keep a reference to avoid garbage collection
+                image_label.image = photo
                 image_label.pack(padx=10, pady=10)
-            
-            # Ensure the window is destroyed properly
             plot_window.protocol("WM_DELETE_WINDOW", plot_window.destroy)
-            
         except Exception as e:
             messagebox.showerror("Error", f"Failed to display plots: {str(e)}")
 

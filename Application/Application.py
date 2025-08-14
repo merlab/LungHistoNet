@@ -10,10 +10,8 @@ import io
 from io import BytesIO
 import plotly.graph_objects as go
 from concurrent.futures import ProcessPoolExecutor
-from pydrive2.auth import GoogleAuth
-from pydrive2.drive import GoogleDrive
 from oauth2client.service_account import ServiceAccountCredentials
-from googleapiclient.http import MediaIoBaseDownload
+from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 from googleapiclient.discovery import build
 import json
 import shutil
@@ -53,7 +51,6 @@ class CloudImageApp:
             self.root.quit()
             return
         self.drive_service = self.initialize_drive_service()
-        self.drive = self.initialize_google_drive()
         self.temp_dir = tempfile.mkdtemp()
         self.processed_dir = os.path.join(self.temp_dir, "processed")
         self.final_dir = os.path.join(self.temp_dir, "final")
@@ -71,9 +68,9 @@ class CloudImageApp:
             if self.image_index >= len(self.image_list):
                 self.image_index = 0
         else:
-            self.image_index = 0
+            self.image_index = self.recover_last_index()  # New: Try to recover index
         if self.image_list:
-            self.load_image()
+            self.check_and_load_image()  # Modified: Check for duplicates before loading
         else:
             messagebox.showerror("Error", "No images found in cloud folder")
             self.root.quit()
@@ -158,15 +155,17 @@ class CloudImageApp:
                 json.dump(state, f)
             user_folder_id = self.create_or_get_user_folder()
             query = f"'{user_folder_id}' in parents and name='app_state.json' and trashed=false"
-            existing_files = self.drive_service.files().list(
-                q=query, 
-                fields="files(id, name)"
-            ).execute().get('files', [])
-            for file in existing_files:
-                self.drive_service.files().delete(fileId=file['id']).execute()
-            self.upload_to_drive(state_file_path, 'app_state.json', user_folder_id)
+            existing_files = self.drive_service.files().list(q=query, fields="files(id)").execute().get('files', [])
+            if existing_files:
+                file_id = existing_files[0]['id']
+                media = MediaIoBaseUpload(open(state_file_path, 'rb'), mimetype='application/json')
+                self.drive_service.files().update(fileId=file_id, media_body=media).execute()
+            else:
+                file_metadata = {'name': 'app_state.json', 'parents': [user_folder_id]}
+                media = MediaIoBaseUpload(open(state_file_path, 'rb'), mimetype='application/json')
+                self.drive_service.files().create(body=file_metadata, media_body=media).execute()
         except Exception as e:
-            pass
+            pass  # Keep local state even if cloud upload fails
 
     def initialize_drive_service(self):
         creds = ServiceAccountCredentials.from_json_keyfile_name(
@@ -193,9 +192,9 @@ class CloudImageApp:
             user_folder_id = self.create_or_get_user_folder()
             query = f"'{user_folder_id}' in parents and name='app_state.json' and trashed=false"
             state_files = self.drive_service.files().list(q=query, fields="files(id)").execute().get('files', [])
+            state_file_path = os.path.join(self.state_dir, 'app_state.json')
             if state_files:
                 state_file_id = state_files[0]['id']
-                state_file_path = os.path.join(self.state_dir, 'app_state.json')
                 if self.download_from_drive(state_file_id, state_file_path):
                     with open(state_file_path, 'r') as f:
                         state = json.load(f)
@@ -205,9 +204,76 @@ class CloudImageApp:
                             if img['id'] == saved_image_info.get('id'):
                                 self.user_name = state.get('user_name', self.user_name)
                                 self.image_index = state.get('image_index', 0)
-                                self.current_image_info = saved_image_info
                                 return True
+            # Fallback to local state if cloud state is missing
+            if os.path.exists(state_file_path):
+                with open(state_file_path, 'r') as f:
+                    state = json.load(f)
+                saved_image_info = state.get('current_image_info', {})
+                if saved_image_info:
+                    for img in self.image_list:
+                        if img['id'] == saved_image_info.get('id'):
+                            self.user_name = state.get('user_name', self.user_name)
+                            self.image_index = state.get('image_index', 0)
+                            return True
             return False
+        except Exception as e:
+            return False
+
+    def recover_last_index(self):
+        """Scan cloud for the last annotated image to estimate progress."""
+        try:
+            user_folder_id = self.create_or_get_user_folder()
+            mouse_folders = self.drive_service.files().list(
+                q=f"'{user_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
+                fields="files(id, name)"
+            ).execute().get('files', [])
+            last_index = 0
+            for mouse_folder in mouse_folders:
+                files = self.drive_service.files().list(
+                    q=f"'{mouse_folder['id']}' in parents and trashed=false",
+                    fields="files(name)"
+                ).execute().get('files', [])
+                for file in files:
+                    if file['name'].endswith('_coords.txt'):
+                        image_name = file['name'].replace('_coords.txt', '')
+                        for i, img in enumerate(self.image_list):
+                            if img['name'] == image_name and i > last_index:
+                                last_index = i
+            return last_index
+        except Exception as e:
+            return 0
+
+    def check_and_load_image(self):
+        """Check if the current image has existing annotations and prompt user."""
+        self.current_image_info = self.image_list[self.image_index]
+        if self.check_existing_annotations():
+            dialog = tk.Toplevel(self.root)
+            dialog.title("Duplicate Annotation")
+            dialog.geometry("300x150")
+            tk.Label(dialog, text=f"Annotations exist for {self.current_image_info['name']}.\nModify or skip?").pack(pady=10)
+            def modify():
+                dialog.destroy()
+                self.load_image()
+            def skip():
+                dialog.destroy()
+                self.load_next_image()
+            tk.Button(dialog, text="Modify", command=modify).pack(side=tk.LEFT, padx=10, pady=10)
+            tk.Button(dialog, text="Skip", command=skip).pack(side=tk.RIGHT, padx=10, pady=10)
+            dialog.wait_window()
+        else:
+            self.load_image()
+
+    def check_existing_annotations(self):
+        """Check if the current image has existing annotations in the cloud."""
+        try:
+            user_folder_id = self.create_or_get_user_folder()
+            mouse_name = self.current_image_info['gene']
+            mouse_folder_id = self.create_or_get_mouse_folder(mouse_name, user_folder_id)
+            coord_name = f"{os.path.splitext(self.current_image_info['name'])[0]}_coords.txt"
+            query = f"name='{coord_name}' and '{mouse_folder_id}' in parents and trashed=false"
+            files = self.drive_service.files().list(q=query, fields="files(id)").execute().get('files', [])
+            return len(files) > 0
         except Exception as e:
             return False
 
@@ -259,12 +325,6 @@ class CloudImageApp:
         folder = self.drive_service.files().create(body=folder_metadata, fields='id').execute()
         return folder['id']
 
-    def initialize_google_drive(self):
-        gauth = GoogleAuth()
-        gauth.credentials = ServiceAccountCredentials.from_json_keyfile_name(
-            self.service_account_file, self.scopes)
-        return GoogleDrive(gauth)
-
     def load_cloud_images(self):
         try:
             folders = self.drive_service.files().list(
@@ -300,15 +360,17 @@ class CloudImageApp:
             messagebox.showerror("Download Error", f"Failed to download file: {str(e)}")
             return False
 
-    def upload_to_drive(self, file_path, file_name, parent_folder_id):
+    def upload_or_update(self, file_path, file_name, parent_folder_id):
         try:
-            file_metadata = {
-                'title': file_name,
-                'parents': [{'id': parent_folder_id}]
-            }
-            file_to_upload = self.drive.CreateFile(file_metadata)
-            file_to_upload.SetContentFile(file_path)
-            file_to_upload.Upload()
+            query = f"'{parent_folder_id}' in parents and name='{file_name}' and trashed=false"
+            existing = self.drive_service.files().list(q=query, fields="files(id)").execute().get('files', [])
+            media = MediaIoBaseUpload(open(file_path, 'rb'), mimetype='application/octet-stream', resumable=True)
+            if existing:
+                file_id = existing[0]['id']
+                self.drive_service.files().update(fileId=file_id, media_body=media).execute()
+            else:
+                file_metadata = {'name': file_name, 'parents': [parent_folder_id]}
+                self.drive_service.files().create(body=file_metadata, media_body=media).execute()
             return True
         except Exception as e:
             messagebox.showerror("Upload Error", f"Failed to upload {file_name}: {str(e)}")
@@ -321,6 +383,16 @@ class CloudImageApp:
         if self.download_from_drive(self.current_image_info['id'], temp_image_path):
             self.current_image_path = temp_image_path
             self.display_image(temp_image_path)
+            # Load existing annotations if any
+            coord_name = f"{os.path.splitext(self.current_image_info['name'])[0]}_coords.txt"
+            user_folder_id = self.create_or_get_user_folder()
+            mouse_folder_id = self.create_or_get_mouse_folder(self.current_image_info['gene'], user_folder_id)
+            query = f"name='{coord_name}' and '{mouse_folder_id}' in parents and trashed=false"
+            files = self.drive_service.files().list(q=query, fields="files(id)").execute().get('files', [])
+            if files:
+                coord_path = os.path.join(self.coords_dir, coord_name)
+                if self.download_from_drive(files[0]['id'], coord_path):
+                    self.rectangles = self.load_coordinates(self.current_image_info['name'])
         else:
             messagebox.showerror("Error", f"Failed to download image: {self.current_image_info['name']}")
 
@@ -399,83 +471,43 @@ class CloudImageApp:
         except Exception as e:
             messagebox.showerror("Processing Error", f"Neutrophil processing failed: {str(e)}")
 
-    # def process_hyaline_membranes(self):
-    #     try:
-    #         original_path = os.path.join(self.temp_dir, self.current_image_info['name'])
-    #         processed_path = os.path.join(self.processed_dir, self.current_image_info['name'])
-    #         if os.path.exists(original_path):
-    #             shutil.copy2(original_path, processed_path)
-    #             self.current_feature = "Hyaline Membranes"
-    #             self.display_image(processed_path)
-    #             self.show_post_processing_options()
-    #         else:
-    #             messagebox.showerror("Error", "Original image not found")
-    #     except Exception as e:
-    #         messagebox.showerror("Error", f"Failed to prepare for editing: {str(e)}")
-
     def process_hyaline_membranes(self):
         try:
-            # Load the image
             tile = cv2.imread(self.current_image_path)
             image_intact = tile.copy()
-
-            # Convert to HSV for better color-based segmentation
             hsv_tile = cv2.cvtColor(tile, cv2.COLOR_BGR2HSV)
-
-            # Define color range for eosinophilic (pink) regions typical of hyaline membranes
-            lower_pink = np.array([140, 50, 50])  # Adjust based on staining
+            lower_pink = np.array([140, 50, 50])
             upper_pink = np.array([170, 255, 255])
             pink_mask = cv2.inRange(hsv_tile, lower_pink, upper_pink)
-
-            # Apply morphological operations to reduce noise and connect regions
             kernel = np.ones((5, 5), np.uint8)
             pink_mask = cv2.morphologyEx(pink_mask, cv2.MORPH_CLOSE, kernel)
             pink_mask = cv2.morphologyEx(pink_mask, cv2.MORPH_OPEN, kernel)
-
-            # Find contours of potential hyaline membrane regions
             contours, _ = cv2.findContours(pink_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-            # Process each contour
             for contour in contours:
                 area = cv2.contourArea(contour)
                 perimeter = cv2.arcLength(contour, True)
-
-                # Skip small or invalid contours
                 if area < 500 or perimeter == 0:
                     continue
-
-                # Calculate elongation (hyaline membranes are often linear/elongated)
                 x, y, w, h = cv2.boundingRect(contour)
                 elongation = max(w, h) / min(w, h) if min(w, h) > 0 else 0
-
-                # Calculate color consistency (mean intensity in the pink range)
                 mask = np.zeros_like(pink_mask)
                 cv2.drawContours(mask, [contour], -1, 255, thickness=cv2.FILLED)
-                mean_color = cv2.mean(hsv_tile, mask=mask)[:3]  # Mean HSV values
-                hue_score = 1.0 if 140 <= mean_color[0] <= 170 else 0.5  # Penalize if hue deviates
-
-                # Score the contour based on area, elongation, and color
+                mean_color = cv2.mean(hsv_tile, mask=mask)[:3]
+                hue_score = 1.0 if 140 <= mean_color[0] <= 170 else 0.5
                 score = self.calculate_hyaline_score(area, elongation, hue_score)
-                if score < 0.3:  # Threshold for confidence
+                if score < 0.3:
                     continue
-
-                # Draw rectangle and score
-                color = self.feature_colors.get("Hyaline Membranes", (0, 255, 255))  # Cyan as default
+                color = self.feature_colors.get("Hyaline Membranes", (0, 255, 255))
                 cv2.rectangle(tile, (x, y), (x + w, y + h), color, 2)
                 score_text = f"{score * 100:.2f}%"
                 text_position = (x, y - 10)
                 cv2.putText(tile, score_text, text_position, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
-
-                # Store rectangle for further use
                 self.rectangles.append((x, y, x + w, y + h, "Hyaline Membranes"))
-
-            # Save and display the processed image
             processed_path = os.path.join(self.processed_dir, self.current_image_info['name'])
             cv2.imwrite(processed_path, tile)
             self.update_coordinates_file()
             self.display_image(processed_path)
             self.show_post_processing_options()
-
         except Exception as e:
             messagebox.showerror("Processing Error", f"Hyaline membrane processing failed: {str(e)}")
 
@@ -501,13 +533,8 @@ class CloudImageApp:
         return score
     
     def calculate_hyaline_score(self, area, elongation, hue_score):
-        # Normalize area (500 to 5000 as typical range for hyaline membranes)
         area_score = min(max((area - 500) / (5000 - 500), 0), 1)
-        
-        # Normalize elongation (hyaline membranes are elongated, so favor higher values)
         elongation_score = min(max((elongation - 2) / (10 - 2), 0), 1)
-        
-        # Combine scores (weights tuned for hyaline membrane characteristics)
         score = 0.4 * area_score + 0.4 * elongation_score + 0.2 * hue_score
         return score
 
@@ -580,9 +607,9 @@ class CloudImageApp:
             user_folder_id = self.create_or_get_user_folder()
             mouse_name = self.current_image_info['gene']
             mouse_folder_id = self.create_or_get_mouse_folder(mouse_name, user_folder_id)
-            if not self.upload_to_drive(final_path, self.current_image_info['name'], mouse_folder_id):
+            if not self.upload_or_update(final_path, self.current_image_info['name'], mouse_folder_id):
                 return
-            if not self.upload_to_drive(coord_file, os.path.basename(coord_file), mouse_folder_id):
+            if not self.upload_or_update(coord_file, os.path.basename(coord_file), mouse_folder_id):
                 return
             self.image_processed = False
         except Exception as e:
@@ -599,7 +626,7 @@ class CloudImageApp:
             self.root.quit()
             return
         self.save_state()
-        self.load_image()
+        self.check_and_load_image()
 
     def verify_folder_structure(self):
         try:
@@ -792,10 +819,10 @@ class CloudImageApp:
         try:
             for root_dir, dirs, files in os.walk(self.temp_dir, topdown=False):
                 for name in files:
-                    os.remove(os.path.join(root_dir, name))
+                    if name != 'app_state.json':  # Preserve local app_state.json
+                        os.remove(os.path.join(root_dir, name))
                 for name in dirs:
                     os.rmdir(os.path.join(root_dir, name))
-            os.rmdir(self.temp_dir)
         except Exception as e:
             pass
 
@@ -985,35 +1012,24 @@ class CloudImageApp:
     def calculate_iou(self, box1, box2):
         x1, y1, x2, y2 = box1
         x1_b, y1_b, x2_b, y2_b = box2
-
         xi1 = max(x1, x1_b)
         yi1 = max(y1, y1_b)
         xi2 = min(x2, x2_b)
         yi2 = min(y2, y2_b)
-
-        # Calculate intersection area
         inter_width = max(0, xi2 - xi1)
         inter_height = max(0, yi2 - yi1)
         inter_area = inter_width * inter_height
-
-        # Calculate areas of both boxes
         box1_area = (x2 - x1) * (y2 - y1)
         box2_area = (x2_b - x1_b) * (y2_b - y1_b)
-
-        # Calculate union area
         union_area = box1_area + box2_area - inter_area
-
-        # Avoid division by zero
         if union_area == 0:
             return 0.0
-
         return inter_area / union_area
 
     def generate_visualizations(self, temp_dir):
         try:
             viz_dir = os.path.join(temp_dir, "visualizations")
             os.makedirs(viz_dir, exist_ok=True)
-            # Exclude 'visualizations' directory from observers
             observers = [
                 d for d in os.listdir(temp_dir)
                 if os.path.isdir(os.path.join(temp_dir, d)) and d != "visualizations"
@@ -1038,7 +1054,6 @@ class CloudImageApp:
                     if file.endswith('_coords.txt'):
                         mouse = file.split('_')[0]
                         mouse_conditions.add(mouse)
-
             for mouse in mouse_conditions:
                 for feature in class_mapping.keys():
                     plot_data = []
@@ -1048,10 +1063,8 @@ class CloudImageApp:
                         for file in os.listdir(observer_dir):
                             if file.startswith(mouse) and file.endswith('_coords.txt'):
                                 image_files_list.append(file)
-
                     for coord_file in set(image_files_list):
                         image_name = coord_file.replace('_coords.txt', '')
-                        # Load bounding boxes for each observer
                         observer_boxes = {}
                         for observer in observers:
                             coord_path = os.path.join(temp_dir, observer, coord_file)
@@ -1064,26 +1077,19 @@ class CloudImageApp:
                                             x1, y1, x2, y2 = map(int, parts[:4])
                                             boxes.append([x1, y1, x2, y2])
                             observer_boxes[observer] = boxes
-
-                        # Calculate "Common" using IoU-based intersection across all observers
                         if not all(observer_boxes[obs] for obs in observers):
-                            common_count = 0  # If any observer has no boxes, common is 0
+                            common_count = 0
                         else:
-                            # Start with the first observer's boxes
                             common_boxes = observer_boxes[observers[0]].copy()
                             matched_indices = {obs: [False] * len(observer_boxes[obs]) for obs in observers}
-
-                            # Iteratively intersect with each subsequent observer
                             for i in range(1, len(observers)):
                                 current_observer = observers[i]
                                 new_common_boxes = []
                                 matched_indices[current_observer] = [False] * len(observer_boxes[current_observer])
-
                                 for box1 in common_boxes:
-                                    best_iou = 0.1  # IoU threshold
+                                    best_iou = 0.1
                                     best_match = None
                                     best_idx = None
-
                                     for j, box2 in enumerate(observer_boxes[current_observer]):
                                         if not matched_indices[current_observer][j]:
                                             iou = self.calculate_iou(box1, box2)
@@ -1091,9 +1097,7 @@ class CloudImageApp:
                                                 best_iou = iou
                                                 best_match = box2
                                                 best_idx = j
-
                                     if best_match:
-                                        # Average the coordinates to create an intersection box
                                         avg_box = [
                                             (box1[0] + best_match[0]) / 2,
                                             (box1[1] + best_match[1]) / 2,
@@ -1102,23 +1106,16 @@ class CloudImageApp:
                                         ]
                                         new_common_boxes.append(avg_box)
                                         matched_indices[current_observer][best_idx] = True
-
                                 common_boxes = new_common_boxes
-
                             common_count = len(common_boxes)
-
-                        # Count individual observer annotations
                         counts = {observer: len(observer_boxes[observer]) for observer in observers}
-                        # Debug: Log counts and common
                         print(f"Image: {image_name}, Feature: {feature}, Counts: {counts}, Common: {common_count}")
                         plot_data.append({
                             'Image': image_name,
                             **counts,
                             'Common': common_count
                         })
-
                     df = pd.DataFrame(plot_data)
-                    # Debug: Check if Common is zero
                     if df['Common'].sum() == 0:
                         print(f"Warning: No common annotations for {feature} in {mouse}. Check coordinate files.")
                     image_path = self.create_variability_plot(
@@ -1131,7 +1128,6 @@ class CloudImageApp:
     
     def create_variability_plot(self, df, mouse, feature, observers, color_mapping, viz_dir):
         try:
-            # Normalize so each bar totals 100%
             df['Total'] = df[observers].sum(axis=1) + df['Common']
             for observer in observers:
                 df[observer] = (df[observer] / df['Total']) * 100
@@ -1139,7 +1135,6 @@ class CloudImageApp:
             df = df.sort_values(by=observers[0], ascending=False)
             df['index'] = range(len(df))
             fig = go.Figure()
-            # Plot first observer
             fig.add_trace(go.Bar(
                 x=df['index'],
                 y=df[observers[0]],
@@ -1148,7 +1143,6 @@ class CloudImageApp:
                 text=df[observers[0]].round(1).astype(str) + '%',
                 textposition='inside'
             ))
-            # Plot Common
             fig.add_trace(go.Bar(
                 x=df['index'],
                 y=df["Common"],
@@ -1158,7 +1152,6 @@ class CloudImageApp:
                 text=df["Common"].round(1).astype(str) + '%',
                 textposition='inside'
             ))
-            # Plot remaining observers
             for i, observer in enumerate(observers[1:], 1):
                 base = df[[observers[0], "Common"]].sum(axis=1) if i == 1 else df[observers[:i] + ["Common"]].sum(axis=1)
                 fig.add_trace(go.Bar(

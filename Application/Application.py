@@ -168,9 +168,18 @@ class CloudImageApp:
             pass  # Keep local state even if cloud upload fails
 
     def initialize_drive_service(self):
-        creds = ServiceAccountCredentials.from_json_keyfile_name(
-            self.service_account_file, self.scopes)
-        return build('drive', 'v3', credentials=creds)
+        try:
+            if not os.path.exists(self.service_account_file):
+                raise FileNotFoundError(f"Service account file {self.service_account_file} not found")
+            creds = ServiceAccountCredentials.from_json_keyfile_name(
+                self.service_account_file, self.scopes)
+            if not creds:
+                raise ValueError("Failed to load credentials from service account file")
+            return build('drive', 'v3', credentials=creds)
+        except Exception as e:
+            messagebox.showerror("Authentication Error", f"Failed to initialize Google Drive service: {str(e)}")
+            self.root.quit()
+            raise
 
     def get_username(self):
         dialog = tk.Toplevel(self.root)
@@ -244,54 +253,68 @@ class CloudImageApp:
         except Exception as e:
             return 0
 
-    # def check_and_load_image(self):
-    #     """Check if the current image has existing annotations and prompt user."""
-    #     self.current_image_info = self.image_list[self.image_index]
-    #     if self.check_existing_annotations():
-    #         dialog = tk.Toplevel(self.root)
-    #         dialog.title("Duplicate Annotation")
-    #         dialog.geometry("300x150")
-    #         tk.Label(dialog, text=f"Annotations exist for {self.current_image_info['name']}.\nModify or skip?").pack(pady=10)
-    #         def modify():
-    #             dialog.destroy()
-    #             self.load_image()
-    #         def skip():
-    #             dialog.destroy()
-    #             self.load_next_image()
-    #         tk.Button(dialog, text="Modify", command=modify).pack(side=tk.LEFT, padx=10, pady=10)
-    #         tk.Button(dialog, text="Skip", command=skip).pack(side=tk.RIGHT, padx=10, pady=10)
-    #         dialog.wait_window()
-    #     else:
-    #         self.load_image()
-
     def check_and_load_image(self):
-        while self.image_index < len(self.image_list):
-            self.current_image_info = self.image_list[self.image_index]
-            if self.check_existing_annotations():
-                print("skipping existing annotations for", self.current_image_info['name'])
-                self.image_index += 1
-                self.image_processed = False
-                self.rectangles = []
-                if self.image_index >= len(self.image_list):
-                    messagebox.showinfo("Complete", "All images already annotated!")
-                    self.root.quit()
-                    return
-                self.save_state()
-            else:
-                self.load_image()
-                break
+            """Check if the current image has existing annotations and skip if found."""
+            while self.image_index < len(self.image_list):
+                self.current_image_info = self.image_list[self.image_index]
+                if self.check_existing_annotations():
+                    print(f"Skipping existing annotations for {self.current_image_info['name']}")
+                    self.image_index += 1
+                    self.image_processed = False
+                    self.rectangles = []
+                    if self.image_index >= len(self.image_list):
+                        messagebox.showinfo("Complete", f"All {len(self.image_list)} images already annotated!")
+                        self.root.quit()
+                        return
+                    self.save_state()
+                else:
+                    print(f"Loading unannotated image: {self.current_image_info['name']}")
+                    self.load_image()
+                    break
+            if self.image_index >= len(self.image_list):
+                messagebox.showinfo("Complete", f"No unannotated images found among {len(self.image_list)} tiles!")
+                self.root.quit()
 
     def check_existing_annotations(self):
-        """Check if the current image has existing annotations in the cloud."""
+        """Check if the current image and its coordinates exist in the user's output folder."""
         try:
             user_folder_id = self.create_or_get_user_folder()
             mouse_name = self.current_image_info['gene']
             mouse_folder_id = self.create_or_get_mouse_folder(mouse_name, user_folder_id)
-            coord_name = f"{os.path.splitext(self.current_image_info['name'])[0]}_coords.txt"
-            query = f"name='{coord_name}' and '{mouse_folder_id}' in parents and trashed=false"
-            files = self.drive_service.files().list(q=query, fields="files(id)").execute().get('files', [])
-            return len(files) > 0
+            image_name = self.current_image_info['name']
+            coord_name = f"{os.path.splitext(image_name)[0]}_coords.txt"
+
+            # Check if the image exists in the output folder
+            image_query = f"name='{image_name}' and '{mouse_folder_id}' in parents and trashed=false"
+            image_files = self.drive_service.files().list(q=image_query, fields="files(id)").execute().get('files', [])
+            print(f"Checking output for image {image_name}: Found {len(image_files)} files")
+
+            # Check if the coordinate file exists in the output folder
+            coord_query = f"name='{coord_name}' and '{mouse_folder_id}' in parents and trashed=false"
+            coord_files = self.drive_service.files().list(q=coord_query, fields="files(id)").execute().get('files', [])
+            print(f"Checking output for coords {coord_name}: Found {len(coord_files)} files")
+
+            # Verify the image exists in the input folder
+            input_folders = self.drive_service.files().list(
+                q=f"'{self.input_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
+                fields="files(id, name)"
+            ).execute().get('files', [])
+            image_in_input = False
+            for folder in input_folders:
+                if folder['name'] == mouse_name:
+                    image_query = f"name='{image_name}' and '{folder['id']}' in parents and trashed=false"
+                    input_files = self.drive_service.files().list(q=image_query, fields="files(id)").execute().get('files', [])
+                    print(f"Checking input for image {image_name} in folder {mouse_name}: Found {len(input_files)} files")
+                    if input_files:
+                        image_in_input = True
+                        break
+
+            # Log the result
+            result = len(image_files) > 0 and len(coord_files) > 0 and image_in_input
+            print(f"Duplicate check for {image_name}: image_in_output={len(image_files) > 0}, coords_in_output={len(coord_files) > 0}, image_in_input={image_in_input}, is_duplicate={result}")
+            return result
         except Exception as e:
+            print(f"Error checking annotations for {self.current_image_info['name']}: {str(e)}")
             return False
 
     def create_output_folder(self):
@@ -379,17 +402,22 @@ class CloudImageApp:
 
     def upload_or_update(self, file_path, file_name, parent_folder_id):
         try:
+            if not os.path.exists(file_path):
+                raise FileNotFoundError(f"File {file_path} does not exist")
             query = f"'{parent_folder_id}' in parents and name='{file_name}' and trashed=false"
             existing = self.drive_service.files().list(q=query, fields="files(id)").execute().get('files', [])
             media = MediaIoBaseUpload(open(file_path, 'rb'), mimetype='application/octet-stream', resumable=True)
             if existing:
                 file_id = existing[0]['id']
                 self.drive_service.files().update(fileId=file_id, media_body=media).execute()
+                print(f"Updated file {file_name} in Google Drive (ID: {file_id})")
             else:
                 file_metadata = {'name': file_name, 'parents': [parent_folder_id]}
                 self.drive_service.files().create(body=file_metadata, media_body=media).execute()
+                print(f"Uploaded new file {file_name} to Google Drive")
             return True
         except Exception as e:
+            print(f"Upload error for {file_name}: {str(e)}")
             messagebox.showerror("Upload Error", f"Failed to upload {file_name}: {str(e)}")
             return False
 

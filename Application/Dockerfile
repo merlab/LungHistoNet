@@ -13,6 +13,8 @@ RUN apt-get update && apt-get install -y \
 # Copy the current directory contents into the container at /app
 COPY . /app
 
+COPY lunginsightcloud-fa31002e7988.json /app/lunginsightcloud-fa31002e7988.json
+
 # Install any needed packages specified in requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 RUN mkdir -p /app/visualizations && chmod -R 777 /app/visualizations

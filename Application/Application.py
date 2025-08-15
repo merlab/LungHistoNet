@@ -244,25 +244,42 @@ class CloudImageApp:
         except Exception as e:
             return 0
 
+    # def check_and_load_image(self):
+    #     """Check if the current image has existing annotations and prompt user."""
+    #     self.current_image_info = self.image_list[self.image_index]
+    #     if self.check_existing_annotations():
+    #         dialog = tk.Toplevel(self.root)
+    #         dialog.title("Duplicate Annotation")
+    #         dialog.geometry("300x150")
+    #         tk.Label(dialog, text=f"Annotations exist for {self.current_image_info['name']}.\nModify or skip?").pack(pady=10)
+    #         def modify():
+    #             dialog.destroy()
+    #             self.load_image()
+    #         def skip():
+    #             dialog.destroy()
+    #             self.load_next_image()
+    #         tk.Button(dialog, text="Modify", command=modify).pack(side=tk.LEFT, padx=10, pady=10)
+    #         tk.Button(dialog, text="Skip", command=skip).pack(side=tk.RIGHT, padx=10, pady=10)
+    #         dialog.wait_window()
+    #     else:
+    #         self.load_image()
+
     def check_and_load_image(self):
-        """Check if the current image has existing annotations and prompt user."""
-        self.current_image_info = self.image_list[self.image_index]
-        if self.check_existing_annotations():
-            dialog = tk.Toplevel(self.root)
-            dialog.title("Duplicate Annotation")
-            dialog.geometry("300x150")
-            tk.Label(dialog, text=f"Annotations exist for {self.current_image_info['name']}.\nModify or skip?").pack(pady=10)
-            def modify():
-                dialog.destroy()
+        while self.image_index < len(self.image_list):
+            self.current_image_info = self.image_list[self.image_index]
+            if self.check_existing_annotations():
+                print("skipping existing annotations for", self.current_image_info['name'])
+                self.image_index += 1
+                self.image_processed = False
+                self.rectangles = []
+                if self.image_index >= len(self.image_list):
+                    messagebox.showinfo("Complete", "All images already annotated!")
+                    self.root.quit()
+                    return
+                self.save_state()
+            else:
                 self.load_image()
-            def skip():
-                dialog.destroy()
-                self.load_next_image()
-            tk.Button(dialog, text="Modify", command=modify).pack(side=tk.LEFT, padx=10, pady=10)
-            tk.Button(dialog, text="Skip", command=skip).pack(side=tk.RIGHT, padx=10, pady=10)
-            dialog.wait_window()
-        else:
-            self.load_image()
+                break
 
     def check_existing_annotations(self):
         """Check if the current image has existing annotations in the cloud."""

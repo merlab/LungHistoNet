@@ -66,7 +66,7 @@ LungHistoNet is a deep learning project that utilizes Vision Transformers to ana
 
    ```bash
    docker run -it --rm -e DISPLAY=host.docker.internal:0 \
-   amirhosseinebrahimi/lung-injury:latest_v1.1
+   amirhosseinebrahimi/lung-injury:latest_v1.4
    ```
 -  Linux (debian)
    ```BASH

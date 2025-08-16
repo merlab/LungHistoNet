@@ -10,7 +10,7 @@ import io
 from io import BytesIO
 import plotly.graph_objects as go
 from concurrent.futures import ProcessPoolExecutor
-from oauth2client.service_account import ServiceAccountCredentials
+from google.oauth2 import service_account
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 from googleapiclient.discovery import build
 import json
@@ -68,9 +68,9 @@ class CloudImageApp:
             if self.image_index >= len(self.image_list):
                 self.image_index = 0
         else:
-            self.image_index = self.recover_last_index()  # New: Try to recover index
+            self.image_index = self.recover_last_index()
         if self.image_list:
-            self.check_and_load_image()  # Modified: Check for duplicates before loading
+            self.check_and_load_image()
         else:
             messagebox.showerror("Error", "No images found in cloud folder")
             self.root.quit()
@@ -155,7 +155,7 @@ class CloudImageApp:
                 json.dump(state, f)
             user_folder_id = self.create_or_get_user_folder()
             query = f"'{user_folder_id}' in parents and name='app_state.json' and trashed=false"
-            existing_files = self.drive_service.files().list(q=query, fields="files(id)").execute().get('files', [])
+            existing_files = self.list_all_files(q=query, fields="files(id)")
             if existing_files:
                 file_id = existing_files[0]['id']
                 media = MediaIoBaseUpload(open(state_file_path, 'rb'), mimetype='application/json')
@@ -165,17 +165,17 @@ class CloudImageApp:
                 media = MediaIoBaseUpload(open(state_file_path, 'rb'), mimetype='application/json')
                 self.drive_service.files().create(body=file_metadata, media_body=media).execute()
         except Exception as e:
-            pass  # Keep local state even if cloud upload fails
+            print(f"Failed to save state to cloud: {str(e)}")  # Keep local state
 
     def initialize_drive_service(self):
         try:
             if not os.path.exists(self.service_account_file):
                 raise FileNotFoundError(f"Service account file {self.service_account_file} not found")
-            creds = ServiceAccountCredentials.from_json_keyfile_name(
-                self.service_account_file, self.scopes)
-            if not creds:
+            credentials = service_account.Credentials.from_service_account_file(
+                self.service_account_file, scopes=self.scopes)
+            if not credentials:
                 raise ValueError("Failed to load credentials from service account file")
-            return build('drive', 'v3', credentials=creds)
+            return build('drive', 'v3', credentials=credentials)
         except Exception as e:
             messagebox.showerror("Authentication Error", f"Failed to initialize Google Drive service: {str(e)}")
             self.root.quit()
@@ -190,7 +190,8 @@ class CloudImageApp:
         entry.pack(pady=5)
         result = []
         def on_ok():
-            result.append(entry.get())
+            username = entry.get().strip().lower()
+            result.append(username)
             dialog.destroy()
         tk.Button(dialog, text="Submit", command=on_ok).pack(pady=10)
         dialog.wait_window()
@@ -200,7 +201,7 @@ class CloudImageApp:
         try:
             user_folder_id = self.create_or_get_user_folder()
             query = f"'{user_folder_id}' in parents and name='app_state.json' and trashed=false"
-            state_files = self.drive_service.files().list(q=query, fields="files(id)").execute().get('files', [])
+            state_files = self.list_all_files(q=query, fields="files(id)")
             state_file_path = os.path.join(self.state_dir, 'app_state.json')
             if state_files:
                 state_file_id = state_files[0]['id']
@@ -227,22 +228,17 @@ class CloudImageApp:
                             return True
             return False
         except Exception as e:
+            print(f"Failed to load state: {str(e)}")
             return False
 
     def recover_last_index(self):
         """Scan cloud for the last annotated image to estimate progress."""
         try:
             user_folder_id = self.create_or_get_user_folder()
-            mouse_folders = self.drive_service.files().list(
-                q=f"'{user_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
-                fields="files(id, name)"
-            ).execute().get('files', [])
+            mouse_folders = self.list_all_files(q=f"'{user_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false", fields="files(id, name)")
             last_index = 0
             for mouse_folder in mouse_folders:
-                files = self.drive_service.files().list(
-                    q=f"'{mouse_folder['id']}' in parents and trashed=false",
-                    fields="files(name)"
-                ).execute().get('files', [])
+                files = self.list_all_files(q=f"'{mouse_folder['id']}' in parents and trashed=false", fields="files(name)")
                 for file in files:
                     if file['name'].endswith('_coords.txt'):
                         image_name = file['name'].replace('_coords.txt', '')
@@ -251,29 +247,30 @@ class CloudImageApp:
                                 last_index = i
             return last_index
         except Exception as e:
+            print(f"Failed to recover last index: {str(e)}")
             return 0
 
     def check_and_load_image(self):
-            """Check if the current image has existing annotations and skip if found."""
-            while self.image_index < len(self.image_list):
-                self.current_image_info = self.image_list[self.image_index]
-                if self.check_existing_annotations():
-                    print(f"Skipping existing annotations for {self.current_image_info['name']}")
-                    self.image_index += 1
-                    self.image_processed = False
-                    self.rectangles = []
-                    if self.image_index >= len(self.image_list):
-                        messagebox.showinfo("Complete", f"All {len(self.image_list)} images already annotated!")
-                        self.root.quit()
-                        return
-                    self.save_state()
-                else:
-                    print(f"Loading unannotated image: {self.current_image_info['name']}")
-                    self.load_image()
-                    break
-            if self.image_index >= len(self.image_list):
-                messagebox.showinfo("Complete", f"No unannotated images found among {len(self.image_list)} tiles!")
-                self.root.quit()
+        """Check if the current image has existing annotations and skip if found."""
+        while self.image_index < len(self.image_list):
+            self.current_image_info = self.image_list[self.image_index]
+            if self.check_existing_annotations():
+                print(f"Skipping existing annotations for {self.current_image_info['name']}")
+                self.image_index += 1
+                self.image_processed = False
+                self.rectangles = []
+                if self.image_index >= len(self.image_list):
+                    messagebox.showinfo("Complete", f"All {len(self.image_list)} images already annotated!")
+                    self.root.quit()
+                    return
+                self.save_state()
+            else:
+                print(f"Loading unannotated image: {self.current_image_info['name']}")
+                self.load_image()
+                break
+        if self.image_index >= len(self.image_list):
+            messagebox.showinfo("Complete", f"No unannotated images found among {len(self.image_list)} tiles!")
+            self.root.quit()
 
     def check_existing_annotations(self):
         """Check if the current image and its coordinates exist in the user's output folder."""
@@ -286,24 +283,21 @@ class CloudImageApp:
 
             # Check if the image exists in the output folder
             image_query = f"name='{image_name}' and '{mouse_folder_id}' in parents and trashed=false"
-            image_files = self.drive_service.files().list(q=image_query, fields="files(id)").execute().get('files', [])
+            image_files = self.list_all_files(q=image_query, fields="files(id)")
             print(f"Checking output for image {image_name}: Found {len(image_files)} files")
 
             # Check if the coordinate file exists in the output folder
             coord_query = f"name='{coord_name}' and '{mouse_folder_id}' in parents and trashed=false"
-            coord_files = self.drive_service.files().list(q=coord_query, fields="files(id)").execute().get('files', [])
+            coord_files = self.list_all_files(q=coord_query, fields="files(id)")
             print(f"Checking output for coords {coord_name}: Found {len(coord_files)} files")
 
             # Verify the image exists in the input folder
-            input_folders = self.drive_service.files().list(
-                q=f"'{self.input_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
-                fields="files(id, name)"
-            ).execute().get('files', [])
+            input_folders = self.list_all_files(q=f"'{self.input_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false", fields="files(id, name)")
             image_in_input = False
             for folder in input_folders:
                 if folder['name'] == mouse_name:
                     image_query = f"name='{image_name}' and '{folder['id']}' in parents and trashed=false"
-                    input_files = self.drive_service.files().list(q=image_query, fields="files(id)").execute().get('files', [])
+                    input_files = self.list_all_files(q=image_query, fields="files(id)")
                     print(f"Checking input for image {image_name} in folder {mouse_name}: Found {len(input_files)} files")
                     if input_files:
                         image_in_input = True
@@ -320,7 +314,7 @@ class CloudImageApp:
     def create_output_folder(self):
         try:
             user_query = f"name='{self.user_name}' and '{self.output_folder_id}' in parents and mimeType='application/vnd.google-apps.folder'"
-            user_folders = self.drive_service.files().list(q=user_query, fields="files(id,name)").execute().get('files', [])
+            user_folders = self.list_all_files(q=user_query, fields="files(id,name)")
             if not user_folders:
                 user_metadata = {
                     'name': self.user_name,
@@ -336,7 +330,7 @@ class CloudImageApp:
                 user_folder_id = user_folders[0]['id']
             original_folder = self.current_image_info['gene']
             folder_query = f"name='{original_folder}' and '{user_folder_id}' in parents and mimeType='application/vnd.google-apps.folder'"
-            existing_folders = self.drive_service.files().list(q=folder_query, fields="files(id,name)").execute().get('files', [])
+            existing_folders = self.list_all_files(q=folder_query, fields="files(id,name)")
             if not existing_folders:
                 folder_metadata = {
                     'name': original_folder,
@@ -350,11 +344,12 @@ class CloudImageApp:
                 return new_folder['id']
             return existing_folders[0]['id']
         except Exception as e:
+            print(f"Failed to create output folder: {str(e)}")
             raise
 
     def create_or_get_folder(self, folder_name, parent_id):
         query = f"'{parent_id}' in parents and name='{folder_name}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
-        existing = self.drive_service.files().list(q=query, fields="files(id)").execute().get('files', [])
+        existing = self.list_all_files(q=query, fields="files(id)")
         if existing:
             return existing[0]['id']
         folder_metadata = {
@@ -365,16 +360,24 @@ class CloudImageApp:
         folder = self.drive_service.files().create(body=folder_metadata, fields='id').execute()
         return folder['id']
 
+    def list_all_files(self, **kwargs):
+        """Helper to list all files with pagination."""
+        files = []
+        page_token = None
+        while True:
+            response = self.drive_service.files().list(**kwargs, pageToken=page_token, pageSize=1000).execute()
+            files.extend(response.get('files', []))
+            page_token = response.get('nextPageToken')
+            if not page_token:
+                break
+        return files
+
     def load_cloud_images(self):
         try:
-            folders = self.drive_service.files().list(
-                q=f"'{self.input_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
-                fields="files(id, name)").execute().get('files', [])
+            folders = self.list_all_files(q=f"'{self.input_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false", fields="files(id, name)")
             self.image_list = []
             for folder in folders:
-                images = self.drive_service.files().list(
-                    q=f"'{folder['id']}' in parents and trashed=false",
-                    fields="files(id, name, mimeType)").execute().get('files', [])
+                images = self.list_all_files(q=f"'{folder['id']}' in parents and trashed=false", fields="files(id, name, mimeType)")
                 for img in images:
                     if img['name'].lower().endswith(('.png', '.jpg', '.jpeg')):
                         self.image_list.append({
@@ -382,6 +385,7 @@ class CloudImageApp:
                             'name': img['name'],
                             'gene': folder['name']
                         })
+            print(f"Loaded {len(self.image_list)} images from cloud")
             if not self.image_list:
                 raise FileNotFoundError("No images found in cloud folder")
         except Exception as e:
@@ -405,7 +409,7 @@ class CloudImageApp:
             if not os.path.exists(file_path):
                 raise FileNotFoundError(f"File {file_path} does not exist")
             query = f"'{parent_folder_id}' in parents and name='{file_name}' and trashed=false"
-            existing = self.drive_service.files().list(q=query, fields="files(id)").execute().get('files', [])
+            existing = self.list_all_files(q=query, fields="files(id)")
             media = MediaIoBaseUpload(open(file_path, 'rb'), mimetype='application/octet-stream', resumable=True)
             if existing:
                 file_id = existing[0]['id']
@@ -428,12 +432,11 @@ class CloudImageApp:
         if self.download_from_drive(self.current_image_info['id'], temp_image_path):
             self.current_image_path = temp_image_path
             self.display_image(temp_image_path)
-            # Load existing annotations if any
             coord_name = f"{os.path.splitext(self.current_image_info['name'])[0]}_coords.txt"
             user_folder_id = self.create_or_get_user_folder()
             mouse_folder_id = self.create_or_get_mouse_folder(self.current_image_info['gene'], user_folder_id)
             query = f"name='{coord_name}' and '{mouse_folder_id}' in parents and trashed=false"
-            files = self.drive_service.files().list(q=query, fields="files(id)").execute().get('files', [])
+            files = self.list_all_files(q=query, fields="files(id)")
             if files:
                 coord_path = os.path.join(self.coords_dir, coord_name)
                 if self.download_from_drive(files[0]['id'], coord_path):
@@ -652,9 +655,17 @@ class CloudImageApp:
             user_folder_id = self.create_or_get_user_folder()
             mouse_name = self.current_image_info['gene']
             mouse_folder_id = self.create_or_get_mouse_folder(mouse_name, user_folder_id)
+            # Upload image
             if not self.upload_or_update(final_path, self.current_image_info['name'], mouse_folder_id):
-                return
+                return  # Stop if image upload fails
+            # Upload coord if image succeeded
             if not self.upload_or_update(coord_file, os.path.basename(coord_file), mouse_folder_id):
+                # If coord fails, delete the image to avoid mismatch
+                query = f"name='{self.current_image_info['name']}' and '{mouse_folder_id}' in parents and trashed=false"
+                existing_image = self.list_all_files(q=query, fields="files(id)")
+                if existing_image:
+                    self.drive_service.files().delete(fileId=existing_image[0]['id']).execute()
+                messagebox.showerror("Upload Error", "Coordinate file upload failed; rolled back image upload to avoid mismatch.")
                 return
             self.image_processed = False
         except Exception as e:
@@ -667,6 +678,14 @@ class CloudImageApp:
         self.image_processed = False
         self.rectangles = []
         if self.image_index >= len(self.image_list):
+            # full scan for unannotated images
+            for i, image_info in enumerate(self.image_list):
+                self.current_image_info = image_info
+                if not self.check_existing_annotations():
+                    self.image_index = i
+                    self.save_state()
+                    self.check_and_load_image()
+                    return
             messagebox.showinfo("Complete", "All images processed!")
             self.root.quit()
             return
@@ -676,11 +695,11 @@ class CloudImageApp:
     def verify_folder_structure(self):
         try:
             user_query = f"'{self.output_folder_id}' in parents and name='{self.user_name}' and mimeType='application/vnd.google-apps.folder'"
-            user_folders = self.drive_service.files().list(q=user_query).execute().get('files', [])
+            user_folders = self.list_all_files(q=user_query)
             if not user_folders:
                 return False
             mouse_query = f"'{user_folders[0]['id']}' in parents and mimeType='application/vnd.google-apps.folder'"
-            mouse_folders = self.drive_service.files().list(q=mouse_query).execute().get('files', [])
+            mouse_folders = self.list_all_files(q=mouse_query)
             return True
         except Exception as e:
             return False
@@ -688,7 +707,7 @@ class CloudImageApp:
     def create_or_get_user_folder(self):
         try:
             query = f"name='{self.user_name}' and '{self.output_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
-            existing = self.drive_service.files().list(q=query, fields="files(id)").execute().get('files', [])
+            existing = self.list_all_files(q=query, fields="files(id)")
             if existing:
                 return existing[0]['id']
             folder_metadata = {
@@ -705,7 +724,7 @@ class CloudImageApp:
     def create_or_get_mouse_folder(self, mouse_name, parent_folder_id):
         try:
             query = f"name='{mouse_name}' and '{parent_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
-            existing = self.drive_service.files().list(q=query, fields="files(id)").execute().get('files', [])
+            existing = self.list_all_files(q=query, fields="files(id)")
             if existing:
                 return existing[0]['id']
             folder_metadata = {
@@ -855,21 +874,18 @@ class CloudImageApp:
                 except tk.TclError:
                     pass
                 except Exception as e:
-                    pass
+                    print(f"Failed to clear widget {widget_name}: {str(e)}")
                 finally:
                     if hasattr(self, widget_name):
                         delattr(self, widget_name)
 
     def cleanup(self):
         try:
-            for root_dir, dirs, files in os.walk(self.temp_dir, topdown=False):
-                for name in files:
-                    if name != 'app_state.json':  # Preserve local app_state.json
-                        os.remove(os.path.join(root_dir, name))
-                for name in dirs:
-                    os.rmdir(os.path.join(root_dir, name))
+            # Recursively delete all files and subdirectories in temp_dir
+            if os.path.exists(self.temp_dir):
+                shutil.rmtree(self.temp_dir, ignore_errors=True)
         except Exception as e:
-            pass
+            print(f"Cleanup failed: {str(e)}")
 
     def on_close(self):
         self.save_state()
@@ -909,12 +925,10 @@ class CloudImageApp:
     def get_observers_from_drive(self):
         try:
             query = f"'{self.output_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
-            folders = self.drive_service.files().list(
-                q=query, 
-                fields="files(name,id)"
-            ).execute().get('files', [])
+            folders = self.list_all_files(q=query, fields="files(name,id)")
             return [folder['name'] for folder in folders]
         except Exception as e:
+            print(f"Failed to get observers: {str(e)}")
             return []
 
     def find_common_images(self, observers):
@@ -922,44 +936,29 @@ class CloudImageApp:
             observer_mice = {}
             for observer in observers:
                 query = f"name='{observer}' and '{self.output_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
-                observer_folder = self.drive_service.files().list(
-                    q=query, 
-                    fields="files(id)"
-                ).execute().get('files', [])
+                observer_folder = self.list_all_files(q=query, fields="files(id)")
                 if not observer_folder:
                     continue
                 observer_folder_id = observer_folder[0]['id']
                 query = f"'{observer_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
-                mouse_folders = self.drive_service.files().list(
-                    q=query, 
-                    fields="files(name)"
-                ).execute().get('files', [])
+                mouse_folders = self.list_all_files(q=query, fields="files(name)")
                 observer_mice[observer] = {mf['name'] for mf in mouse_folders}
             common_mice = set.intersection(*observer_mice.values())
             common_images = []
             for mouse in common_mice:
                 first_observer = observers[0]
                 query = f"name='{first_observer}' and '{self.output_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
-                first_observer_folder = self.drive_service.files().list(
-                    q=query, 
-                    fields="files(id)"
-                ).execute().get('files', [])
+                first_observer_folder = self.list_all_files(q=query, fields="files(id)")
                 if not first_observer_folder:
                     continue
                 first_observer_folder_id = first_observer_folder[0]['id']
                 query = f"name='{mouse}' and '{first_observer_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
-                mouse_folder = self.drive_service.files().list(
-                    q=query, 
-                    fields="files(id)"
-                ).execute().get('files', [])
+                mouse_folder = self.list_all_files(q=query, fields="files(id)")
                 if not mouse_folder:
                     continue
                 mouse_folder_id = mouse_folder[0]['id']
                 query = f"'{mouse_folder_id}' in parents and mimeType!='application/vnd.google-apps.folder' and trashed=false"
-                images = self.drive_service.files().list(
-                    q=query, 
-                    fields="files(name)"
-                ).execute().get('files', [])
+                images = self.list_all_files(q=query, fields="files(name)")
                 for image in images:
                     image_name = image['name']
                     if image_name.lower().endswith(('.png', '.jpg', '.jpeg')):
@@ -972,33 +971,26 @@ class CloudImageApp:
                             common_images.append((mouse, image_name))
             return common_images
         except Exception as e:
+            print(f"Failed to find common images: {str(e)}")
             return []
 
     def image_exists_for_observer(self, observer, mouse, image_name):
         try:
             query = f"name='{observer}' and '{self.output_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
-            observer_folder = self.drive_service.files().list(
-                q=query, 
-                fields="files(id)"
-            ).execute().get('files', [])
+            observer_folder = self.list_all_files(q=query, fields="files(id)")
             if not observer_folder:
                 return False
             observer_folder_id = observer_folder[0]['id']
             query = f"name='{mouse}' and '{observer_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
-            mouse_folder = self.drive_service.files().list(
-                q=query, 
-                fields="files(id)"
-            ).execute().get('files', [])
+            mouse_folder = self.list_all_files(q=query, fields="files(id)")
             if not mouse_folder:
                 return False
             mouse_folder_id = mouse_folder[0]['id']
             query = f"name='{image_name}' and '{mouse_folder_id}' in parents and trashed=false"
-            images = self.drive_service.files().list(
-                q=query, 
-                fields="files(id)"
-            ).execute().get('files', [])
+            images = self.list_all_files(q=query, fields="files(id)")
             return len(images) > 0
         except Exception as e:
+            print(f"Failed to check image existence: {str(e)}")
             return False
 
     def process_observer_data(self, observers, common_images, temp_dir):
@@ -1015,43 +1007,33 @@ class CloudImageApp:
                     coord_path = os.path.join(observer_dirs[observer], coord_file)
                     self.download_observer_files(observer, mouse, image_name, image_path, coord_path)
         except Exception as e:
+            print(f"Failed to process observer data: {str(e)}")
             raise
 
     def download_observer_files(self, observer, mouse, image_name, image_path, coord_path):
         try:
             query = f"name='{observer}' and '{self.output_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
-            observer_folder = self.drive_service.files().list(
-                q=query, 
-                fields="files(id)"
-            ).execute().get('files', [])
+            observer_folder = self.list_all_files(q=query, fields="files(id)")
             if not observer_folder:
                 raise FileNotFoundError(f"Observer folder not found: {observer}")
             observer_folder_id = observer_folder[0]['id']
             query = f"name='{mouse}' and '{observer_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
-            mouse_folder = self.drive_service.files().list(
-                q=query, 
-                fields="files(id)"
-            ).execute().get('files', [])
+            mouse_folder = self.list_all_files(q=query, fields="files(id)")
             if not mouse_folder:
                 raise FileNotFoundError(f"Mouse folder not found: {mouse}")
             mouse_folder_id = mouse_folder[0]['id']
             query = f"name='{image_name}' and '{mouse_folder_id}' in parents and trashed=false"
-            image_files = self.drive_service.files().list(
-                q=query, 
-                fields="files(id)"
-            ).execute().get('files', [])
+            image_files = self.list_all_files(q=query, fields="files(id)")
             if not image_files:
                 raise FileNotFoundError(f"Image not found: {image_name}")
             self.download_from_drive(image_files[0]['id'], image_path)
             coord_name = os.path.splitext(image_name)[0] + "_coords.txt"
             query = f"name='{coord_name}' and '{mouse_folder_id}' in parents and trashed=false"
-            coord_files = self.drive_service.files().list(
-                q=query, 
-                fields="files(id)"
-            ).execute().get('files', [])
+            coord_files = self.list_all_files(q=query, fields="files(id)")
             if coord_files:
                 self.download_from_drive(coord_files[0]['id'], coord_path)
         except Exception as e:
+            print(f"Failed to download observer files: {str(e)}")
             raise
 
     def calculate_iou(self, box1, box2):
@@ -1169,8 +1151,9 @@ class CloudImageApp:
                     image_files.append((feature, image_path))
             return image_files
         except Exception as e:
-            raise Exception(f"Failed to generate visualizations: {str(e)}")
-    
+            print(f"Failed to generate visualizations: {str(e)}")
+            raise
+
     def create_variability_plot(self, df, mouse, feature, observers, color_mapping, viz_dir):
         try:
             df['Total'] = df[observers].sum(axis=1) + df['Common']
@@ -1229,7 +1212,8 @@ class CloudImageApp:
             fig.write_image(viz_path, format="png")
             return viz_path
         except Exception as e:
-            raise Exception(f"Failed to create variability plot: {str(e)}")
+            print(f"Failed to create variability plot: {str(e)}")
+            raise
 
     def display_plots_window(self, image_files):
         try:

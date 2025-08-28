@@ -214,6 +214,10 @@ class CloudImageApp:
                             if img['id'] == saved_image_info.get('id'):
                                 self.user_name = state.get('user_name', self.user_name)
                                 self.image_index = state.get('image_index', 0)
+                                # Validate image_index is within bounds
+                                if self.image_index >= len(self.image_list):
+                                    self.image_index = 0
+                                    return False
                                 return True
             # Fallback to local state if cloud state is missing
             if os.path.exists(state_file_path):
@@ -225,10 +229,17 @@ class CloudImageApp:
                         if img['id'] == saved_image_info.get('id'):
                             self.user_name = state.get('user_name', self.user_name)
                             self.image_index = state.get('image_index', 0)
+                            # Validate image_index is within bounds
+                            if self.image_index >= len(self.image_list):
+                                self.image_index = 0
+                                return False
                             return True
+            # If state is invalid or missing, reset index and scan for unannotated images
+            self.image_index = 0
             return False
         except Exception as e:
             print(f"Failed to load state: {str(e)}")
+            self.image_index = 0
             return False
 
     def recover_last_index(self):

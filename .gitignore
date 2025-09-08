@@ -18,6 +18,7 @@ Data_Prepration/Tiles
 Data_Prepration/Union_Labels
 Data_Prepration/YOLO_Labels
 Data_Prepration/Yolo_Dataset
+Data_Prepration/*.zip
 
 Application/coords
 Application/*.json

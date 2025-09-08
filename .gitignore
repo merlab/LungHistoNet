@@ -7,14 +7,17 @@ Yolo/*.pt
 Yolo/*.png
 
 
-Eval/healthy/*.png
-Eval/images/*.png
-Eval/Intersection_Labels/
-Eval/labels_O2/
-Eval/labels_O1/
-Eval/Union_Labels/
 Eval/models/*.pt
 Eval/out/*
+
+Data_Prepration/Generated_Masks
+Data_Prepration/Intersection_Labels
+Data_Prepration/Observers
+Data_Prepration/Resized_Tiles
+Data_Prepration/Tiles
+Data_Prepration/Union_Labels
+Data_Prepration/YOLO_Labels
+Data_Prepration/Yolo_Dataset
 
 Application/coords
 Application/*.json

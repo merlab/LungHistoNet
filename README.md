@@ -5,7 +5,9 @@ LungHistoNet is a deep learning project that utilizes Vision Transformers to ana
 # [website](https://lunginsight.ai/)
 
 
-# Application Setup Tutorial
+## TODO
+
+- [ ] Fix/optimize the real-time plot request in the application.
 
 ## MAC
 

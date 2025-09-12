@@ -9,12 +9,14 @@ Yolo/*.png
 
 Eval/models/*.pt
 Eval/out/*
+Eval/CSV_Preds/
 
 Data_Prepration/Generated_Masks
 Data_Prepration/Intersection_Labels
 Data_Prepration/Observers
 Data_Prepration/Resized_Tiles
 Data_Prepration/Tiles
+Data_Prepration/labels
 Data_Prepration/Union_Labels
 Data_Prepration/YOLO_Labels
 Data_Prepration/Yolo_Dataset
@@ -23,3 +25,5 @@ Data_Prepration/*.zip
 Application/coords
 Application/*.json
 Application/test_upload_download.ipynb
+
+Test/

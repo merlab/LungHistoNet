@@ -51,6 +51,11 @@ class CloudImageApp:
             self.root.quit()
             return
         self.drive_service = self.initialize_drive_service()
+        
+        # --- CACHE INITIALIZATION ---
+        self.folder_id_cache = {} # Add this line to initialize the cache
+        # --------------------------
+
         self.temp_dir = tempfile.mkdtemp()
         self.processed_dir = os.path.join(self.temp_dir, "processed")
         self.final_dir = os.path.join(self.temp_dir, "final")
@@ -944,45 +949,62 @@ class CloudImageApp:
 
     def find_common_images(self, observers):
         try:
-            observer_mice = {}
-            for observer in observers:
-                query = f"name='{observer}' and '{self.output_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
-                observer_folder = self.list_all_files(q=query, fields="files(id)")
-                if not observer_folder:
-                    continue
-                observer_folder_id = observer_folder[0]['id']
-                query = f"'{observer_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
-                mouse_folders = self.list_all_files(q=query, fields="files(name)")
-                observer_mice[observer] = {mf['name'] for mf in mouse_folders}
-            common_mice = set.intersection(*observer_mice.values())
+            print("Building file cache from Google Drive. This may take a moment...")
+            self.folder_id_cache.clear()
+            
+            # 1. Get all observer folders and cache their IDs
+            observer_folders_query = f"'{self.output_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+            all_observer_folders = self.list_all_files(q=observer_folders_query, fields="files(id, name)")
+
+            # Filter for the observers we are actually comparing
+            observer_folder_map = {f['name']: f['id'] for f in all_observer_folders if f['name'] in observers}
+
+            for observer_name, observer_id in observer_folder_map.items():
+                self.folder_id_cache[observer_name] = {}
+                
+                # 2. For each observer, get all mouse folders
+                mouse_folders_query = f"'{observer_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+                all_mouse_folders = self.list_all_files(q=mouse_folders_query, fields="files(id, name)")
+                
+                for mouse_folder in all_mouse_folders:
+                    mouse_name = mouse_folder['name']
+                    mouse_id = mouse_folder['id']
+                    self.folder_id_cache[observer_name][mouse_name] = {'folder_id': mouse_id, 'files': {}}
+                    
+                    # 3. For each mouse folder, get all coordinate files
+                    coord_files_query = f"'{mouse_id}' in parents and name contains '_coords.txt' and trashed=false"
+                    all_coord_files = self.list_all_files(q=coord_files_query, fields="files(id, name)")
+                    
+                    for coord_file in all_coord_files:
+                        self.folder_id_cache[observer_name][mouse_name]['files'][coord_file['name']] = coord_file['id']
+            
+            print("Cache built successfully.")
+            
+            # 4. Find common images using the local cache (much faster)
+            if not self.folder_id_cache:
+                return []
+
+            # Find mice common to all observers
+            first_observer_mice = set(self.folder_id_cache[observers[0]].keys())
+            common_mice = first_observer_mice.intersection(*(set(self.folder_id_cache[obs].keys()) for obs in observers[1:]))
+
             common_images = []
             for mouse in common_mice:
-                first_observer = observers[0]
-                query = f"name='{first_observer}' and '{self.output_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
-                first_observer_folder = self.list_all_files(q=query, fields="files(id)")
-                if not first_observer_folder:
-                    continue
-                first_observer_folder_id = first_observer_folder[0]['id']
-                query = f"name='{mouse}' and '{first_observer_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
-                mouse_folder = self.list_all_files(q=query, fields="files(id)")
-                if not mouse_folder:
-                    continue
-                mouse_folder_id = mouse_folder[0]['id']
-                query = f"'{mouse_folder_id}' in parents and mimeType!='application/vnd.google-apps.folder' and trashed=false"
-                images = self.list_all_files(q=query, fields="files(name)")
-                for image in images:
-                    image_name = image['name']
-                    if image_name.lower().endswith(('.png', '.jpg', '.jpeg')):
-                        all_have = True
-                        for observer in observers[1:]:
-                            if not self.image_exists_for_observer(observer, mouse, image_name):
-                                all_have = False
-                                break
-                        if all_have:
-                            common_images.append((mouse, image_name))
+                # Get file list for the first observer for this mouse
+                first_observer_files = set(self.folder_id_cache[observers[0]][mouse]['files'].keys())
+                
+                # Find the intersection with all other observers' files for the same mouse
+                common_files = first_observer_files.intersection(*(set(self.folder_id_cache[obs][mouse]['files'].keys()) for obs in observers[1:]))
+                
+                for coord_file in common_files:
+                    image_name = coord_file.replace('_coords.txt', '')
+                    common_images.append((mouse, image_name))
+            
+            print(f"Found {len(common_images)} common images across {len(observers)} observers.")
             return common_images
         except Exception as e:
             print(f"Failed to find common images: {str(e)}")
+            messagebox.showerror("Error", f"Failed to find common images: {e}")
             return []
 
     def image_exists_for_observer(self, observer, mouse, image_name):
@@ -1006,48 +1028,38 @@ class CloudImageApp:
 
     def process_observer_data(self, observers, common_images, temp_dir):
         try:
-            observer_dirs = {}
+            # Create local directories for each observer
             for observer in observers:
-                observer_dir = os.path.join(temp_dir, observer)
-                os.makedirs(observer_dir, exist_ok=True)
-                observer_dirs[observer] = observer_dir
+                os.makedirs(os.path.join(temp_dir, observer), exist_ok=True)
+            
+            # Download only the coordinate files for each common image
             for mouse, image_name in common_images:
+                coord_name = f"{os.path.splitext(image_name)[0]}_coords.txt"
                 for observer in observers:
-                    coord_file = os.path.splitext(image_name)[0] + "_coords.txt"
-                    coord_path = os.path.join(observer_dirs[observer], coord_file)
-                    self.download_observer_files(observer, mouse, image_name, coord_path)
+                    local_coord_path = os.path.join(temp_dir, observer, coord_name)
+                    # This function will now use the cache
+                    self.download_observer_files(observer, mouse, coord_name, local_coord_path)
         except Exception as e:
             print(f"Failed to process observer data: {str(e)}")
             raise
 
-    def download_observer_files(self, observer, mouse, image_name, coord_path):
+    def download_observer_files(self, observer, mouse, coord_name, coord_path):
         try:
-            query = f"name='{observer}' and '{self.output_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
-            observer_folder = self.list_all_files(q=query, fields="files(id)")
-            if not observer_folder:
-                raise FileNotFoundError(f"Observer folder not found: {observer}")
-            observer_folder_id = observer_folder[0]['id']
-
-            query = f"name='{mouse}' and '{observer_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
-            mouse_folder = self.list_all_files(q=query, fields="files(id)")
-            if not mouse_folder:
-                raise FileNotFoundError(f"Mouse folder not found: {mouse}")
-            mouse_folder_id = mouse_folder[0]['id']
-
-            coord_name = os.path.splitext(image_name)[0] + "_coords.txt"
-            query = f"name='{coord_name}' and '{mouse_folder_id}' in parents and trashed=false"
-            coord_files = self.list_all_files(q=query, fields="files(id)")
+            # Directly get the file ID from the cache, avoiding API searches
+            file_id = self.folder_id_cache.get(observer, {}).get(mouse, {}).get('files', {}).get(coord_name)
             
-            if coord_files:
-                self.download_from_drive(coord_files[0]['id'], coord_path)
+            if file_id:
+                self.download_from_drive(file_id, coord_path)
             else:
-                # If a coordinate file doesn't exist for an observer, create an empty one
-                # to prevent errors during the plot generation phase.
+                # If the file isn't in the cache, it doesn't exist for this observer.
+                # Create an empty file locally to ensure the process doesn't fail.
                 with open(coord_path, 'w') as f:
                     pass
+                print(f"Note: No coord file '{coord_name}' for {observer}/{mouse}. Creating empty file.")
+
         except Exception as e:
-            print(f"Failed to download observer files for {observer}/{mouse}/{image_name}: {str(e)}")
-            # Allow the process to continue by creating an empty file on failure
+            print(f"Failed to download file '{coord_name}' for {observer}: {str(e)}")
+            # Ensure an empty file exists on failure to prevent crashes later
             if not os.path.exists(coord_path):
                 with open(coord_path, 'w') as f:
                     pass

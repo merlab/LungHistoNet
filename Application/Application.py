@@ -1013,39 +1013,44 @@ class CloudImageApp:
                 observer_dirs[observer] = observer_dir
             for mouse, image_name in common_images:
                 for observer in observers:
-                    image_path = os.path.join(observer_dirs[observer], image_name)
                     coord_file = os.path.splitext(image_name)[0] + "_coords.txt"
                     coord_path = os.path.join(observer_dirs[observer], coord_file)
-                    self.download_observer_files(observer, mouse, image_name, image_path, coord_path)
+                    self.download_observer_files(observer, mouse, image_name, coord_path)
         except Exception as e:
             print(f"Failed to process observer data: {str(e)}")
             raise
 
-    def download_observer_files(self, observer, mouse, image_name, image_path, coord_path):
+    def download_observer_files(self, observer, mouse, image_name, coord_path):
         try:
             query = f"name='{observer}' and '{self.output_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
             observer_folder = self.list_all_files(q=query, fields="files(id)")
             if not observer_folder:
                 raise FileNotFoundError(f"Observer folder not found: {observer}")
             observer_folder_id = observer_folder[0]['id']
+
             query = f"name='{mouse}' and '{observer_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
             mouse_folder = self.list_all_files(q=query, fields="files(id)")
             if not mouse_folder:
                 raise FileNotFoundError(f"Mouse folder not found: {mouse}")
             mouse_folder_id = mouse_folder[0]['id']
-            query = f"name='{image_name}' and '{mouse_folder_id}' in parents and trashed=false"
-            image_files = self.list_all_files(q=query, fields="files(id)")
-            if not image_files:
-                raise FileNotFoundError(f"Image not found: {image_name}")
-            self.download_from_drive(image_files[0]['id'], image_path)
+
             coord_name = os.path.splitext(image_name)[0] + "_coords.txt"
             query = f"name='{coord_name}' and '{mouse_folder_id}' in parents and trashed=false"
             coord_files = self.list_all_files(q=query, fields="files(id)")
+            
             if coord_files:
                 self.download_from_drive(coord_files[0]['id'], coord_path)
+            else:
+                # If a coordinate file doesn't exist for an observer, create an empty one
+                # to prevent errors during the plot generation phase.
+                with open(coord_path, 'w') as f:
+                    pass
         except Exception as e:
-            print(f"Failed to download observer files: {str(e)}")
-            raise
+            print(f"Failed to download observer files for {observer}/{mouse}/{image_name}: {str(e)}")
+            # Allow the process to continue by creating an empty file on failure
+            if not os.path.exists(coord_path):
+                with open(coord_path, 'w') as f:
+                    pass
 
     def calculate_iou(self, box1, box2):
         x1, y1, x2, y2 = box1

@@ -9,13 +9,17 @@ import tempfile
 import io
 from io import BytesIO
 import plotly.graph_objects as go
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
+from pydrive2.auth import GoogleAuth
+from pydrive2.drive import GoogleDrive
+from oauth2client.service_account import ServiceAccountCredentials
 from google.oauth2 import service_account
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 from googleapiclient.discovery import build
 import json
 import shutil
 import uuid
+import logging
 
 class CloudImageApp:
     def __init__(self, root):
@@ -46,16 +50,14 @@ class CloudImageApp:
         self.current_image = None
         self.current_feature = "Neutrophils"
         self.image_processed = False
+        self.upload_images = False
         self.user_name = self.get_username()
         if not self.user_name:
             self.root.quit()
             return
         self.drive_service = self.initialize_drive_service()
-        
-        # --- CACHE INITIALIZATION ---
-        self.folder_id_cache = {} # Add this line to initialize the cache
-        # --------------------------
-
+        self.pydrive = self.initialize_pydrive()
+        self.folder_id_cache = {}  # Cache for folder/file IDs
         self.temp_dir = tempfile.mkdtemp()
         self.processed_dir = os.path.join(self.temp_dir, "processed")
         self.final_dir = os.path.join(self.temp_dir, "final")
@@ -80,6 +82,12 @@ class CloudImageApp:
             messagebox.showerror("Error", "No images found in cloud folder")
             self.root.quit()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def initialize_pydrive(self):
+        gauth = GoogleAuth()
+        gauth.credentials = ServiceAccountCredentials.from_json_keyfile_name(
+            self.service_account_file, self.scopes)
+        return GoogleDrive(gauth)
 
     def setup_initial_ui(self):
         for widget in self.main_frame.winfo_children():
@@ -170,7 +178,7 @@ class CloudImageApp:
                 media = MediaIoBaseUpload(open(state_file_path, 'rb'), mimetype='application/json')
                 self.drive_service.files().create(body=file_metadata, media_body=media).execute()
         except Exception as e:
-            print(f"Failed to save state to cloud: {str(e)}")  # Keep local state
+            logging.error(f"Failed to save state to cloud: {str(e)}")
 
     def initialize_drive_service(self):
         try:
@@ -219,12 +227,10 @@ class CloudImageApp:
                             if img['id'] == saved_image_info.get('id'):
                                 self.user_name = state.get('user_name', self.user_name)
                                 self.image_index = state.get('image_index', 0)
-                                # Validate image_index is within bounds
                                 if self.image_index >= len(self.image_list):
                                     self.image_index = 0
                                     return False
                                 return True
-            # Fallback to local state if cloud state is missing
             if os.path.exists(state_file_path):
                 with open(state_file_path, 'r') as f:
                     state = json.load(f)
@@ -234,21 +240,18 @@ class CloudImageApp:
                         if img['id'] == saved_image_info.get('id'):
                             self.user_name = state.get('user_name', self.user_name)
                             self.image_index = state.get('image_index', 0)
-                            # Validate image_index is within bounds
                             if self.image_index >= len(self.image_list):
                                 self.image_index = 0
                                 return False
                             return True
-            # If state is invalid or missing, reset index and scan for unannotated images
             self.image_index = 0
             return False
         except Exception as e:
-            print(f"Failed to load state: {str(e)}")
+            logging.error(f"Failed to load state: {str(e)}")
             self.image_index = 0
             return False
 
     def recover_last_index(self):
-        """Scan cloud for the last annotated image to estimate progress."""
         try:
             user_folder_id = self.create_or_get_user_folder()
             mouse_folders = self.list_all_files(q=f"'{user_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false", fields="files(id, name)")
@@ -263,15 +266,13 @@ class CloudImageApp:
                                 last_index = i
             return last_index
         except Exception as e:
-            print(f"Failed to recover last index: {str(e)}")
+            logging.error(f"Failed to recover last index: {str(e)}")
             return 0
 
     def check_and_load_image(self):
-        """Check if the current image has existing annotations and skip if found."""
         while self.image_index < len(self.image_list):
             self.current_image_info = self.image_list[self.image_index]
             if self.check_existing_annotations():
-                print(f"Skipping existing annotations for {self.current_image_info['name']}")
                 self.image_index += 1
                 self.image_processed = False
                 self.rectangles = []
@@ -281,7 +282,6 @@ class CloudImageApp:
                     return
                 self.save_state()
             else:
-                print(f"Loading unannotated image: {self.current_image_info['name']}")
                 self.load_image()
                 break
         if self.image_index >= len(self.image_list):
@@ -289,42 +289,28 @@ class CloudImageApp:
             self.root.quit()
 
     def check_existing_annotations(self):
-        """Check if the current image and its coordinates exist in the user's output folder."""
         try:
             user_folder_id = self.create_or_get_user_folder()
             mouse_name = self.current_image_info['gene']
             mouse_folder_id = self.create_or_get_mouse_folder(mouse_name, user_folder_id)
             image_name = self.current_image_info['name']
             coord_name = f"{os.path.splitext(image_name)[0]}_coords.txt"
-
-            # Check if the image exists in the output folder
             image_query = f"name='{image_name}' and '{mouse_folder_id}' in parents and trashed=false"
             image_files = self.list_all_files(q=image_query, fields="files(id)")
-            print(f"Checking output for image {image_name}: Found {len(image_files)} files")
-
-            # Check if the coordinate file exists in the output folder
             coord_query = f"name='{coord_name}' and '{mouse_folder_id}' in parents and trashed=false"
             coord_files = self.list_all_files(q=coord_query, fields="files(id)")
-            print(f"Checking output for coords {coord_name}: Found {len(coord_files)} files")
-
-            # Verify the image exists in the input folder
             input_folders = self.list_all_files(q=f"'{self.input_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false", fields="files(id, name)")
             image_in_input = False
             for folder in input_folders:
                 if folder['name'] == mouse_name:
                     image_query = f"name='{image_name}' and '{folder['id']}' in parents and trashed=false"
                     input_files = self.list_all_files(q=image_query, fields="files(id)")
-                    print(f"Checking input for image {image_name} in folder {mouse_name}: Found {len(input_files)} files")
                     if input_files:
                         image_in_input = True
                         break
-
-            # Log the result
-            result = len(image_files) > 0 and len(coord_files) > 0 and image_in_input
-            print(f"Duplicate check for {image_name}: image_in_output={len(image_files) > 0}, coords_in_output={len(coord_files) > 0}, image_in_input={image_in_input}, is_duplicate={result}")
-            return result
+            return len(image_files) > 0 and len(coord_files) > 0 and image_in_input
         except Exception as e:
-            print(f"Error checking annotations for {self.current_image_info['name']}: {str(e)}")
+            logging.error(f"Error checking annotations for {self.current_image_info['name']}: {str(e)}")
             return False
 
     def create_output_folder(self):
@@ -360,7 +346,7 @@ class CloudImageApp:
                 return new_folder['id']
             return existing_folders[0]['id']
         except Exception as e:
-            print(f"Failed to create output folder: {str(e)}")
+            logging.error(f"Failed to create output folder: {str(e)}")
             raise
 
     def create_or_get_folder(self, folder_name, parent_id):
@@ -377,7 +363,6 @@ class CloudImageApp:
         return folder['id']
 
     def list_all_files(self, **kwargs):
-        """Helper to list all files with pagination."""
         files = []
         page_token = None
         while True:
@@ -401,7 +386,6 @@ class CloudImageApp:
                             'name': img['name'],
                             'gene': folder['name']
                         })
-            print(f"Loaded {len(self.image_list)} images from cloud")
             if not self.image_list:
                 raise FileNotFoundError("No images found in cloud folder")
         except Exception as e:
@@ -409,15 +393,11 @@ class CloudImageApp:
 
     def download_from_drive(self, file_id, destination_path):
         try:
-            request = self.drive_service.files().get_media(fileId=file_id)
-            fh = io.FileIO(destination_path, 'wb')
-            downloader = MediaIoBaseDownload(fh, request)
-            done = False
-            while not done:
-                status, done = downloader.next_chunk()
+            file = self.pydrive.CreateFile({'id': file_id})
+            file.GetContentFile(destination_path)
             return True
         except Exception as e:
-            messagebox.showerror("Download Error", f"Failed to download file: {str(e)}")
+            logging.error(f"Failed to download file {file_id} to {destination_path}: {str(e)}")
             return False
 
     def upload_or_update(self, file_path, file_name, parent_folder_id):
@@ -426,18 +406,21 @@ class CloudImageApp:
                 raise FileNotFoundError(f"File {file_path} does not exist")
             query = f"'{parent_folder_id}' in parents and name='{file_name}' and trashed=false"
             existing = self.list_all_files(q=query, fields="files(id)")
-            media = MediaIoBaseUpload(open(file_path, 'rb'), mimetype='application/octet-stream', resumable=True)
             if existing:
                 file_id = existing[0]['id']
-                self.drive_service.files().update(fileId=file_id, media_body=media).execute()
-                print(f"Updated file {file_name} in Google Drive (ID: {file_id})")
+                file = self.pydrive.CreateFile({'id': file_id})
+                file.SetContentFile(file_path)
+                file.Upload()
             else:
-                file_metadata = {'name': file_name, 'parents': [parent_folder_id]}
-                self.drive_service.files().create(body=file_metadata, media_body=media).execute()
-                print(f"Uploaded new file {file_name} to Google Drive")
+                file = self.pydrive.CreateFile({
+                    'title': file_name,
+                    'parents': [{'id': parent_folder_id}]
+                })
+                file.SetContentFile(file_path)
+                file.Upload()
             return True
         except Exception as e:
-            print(f"Upload error for {file_name}: {str(e)}")
+            logging.error(f"Upload error for {file_name}: {str(e)}")
             messagebox.showerror("Upload Error", f"Failed to upload {file_name}: {str(e)}")
             return False
 
@@ -671,18 +654,19 @@ class CloudImageApp:
             user_folder_id = self.create_or_get_user_folder()
             mouse_name = self.current_image_info['gene']
             mouse_folder_id = self.create_or_get_mouse_folder(mouse_name, user_folder_id)
-            # Upload image
-            if not self.upload_or_update(final_path, self.current_image_info['name'], mouse_folder_id):
-                return  # Stop if image upload fails
-            # Upload coord if image succeeded
-            if not self.upload_or_update(coord_file, os.path.basename(coord_file), mouse_folder_id):
-                # If coord fails, delete the image to avoid mismatch
-                query = f"name='{self.current_image_info['name']}' and '{mouse_folder_id}' in parents and trashed=false"
-                existing_image = self.list_all_files(q=query, fields="files(id)")
-                if existing_image:
-                    self.drive_service.files().delete(fileId=existing_image[0]['id']).execute()
-                messagebox.showerror("Upload Error", "Coordinate file upload failed; rolled back image upload to avoid mismatch.")
+            coords_subfolder_id = self.create_or_get_folder('coords', mouse_folder_id)
+            if self.upload_images:
+                images_subfolder_id = self.create_or_get_folder('images', mouse_folder_id)
+            if not self.upload_or_update(coord_file, os.path.basename(coord_file), coords_subfolder_id):
                 return
+            if self.upload_images:
+                if not self.upload_or_update(final_path, self.current_image_info['name'], images_subfolder_id):
+                    coord_query = f"name='{os.path.basename(coord_file)}' and '{coords_subfolder_id}' in parents and trashed=false"
+                    existing_coord = self.list_all_files(q=coord_query, fields="files(id)")
+                    if existing_coord:
+                        self.drive_service.files().delete(fileId=existing_coord[0]['id']).execute()
+                    messagebox.showerror("Upload Error", "Image upload failed; rolled back coordinate upload.")
+                    return
             self.image_processed = False
         except Exception as e:
             messagebox.showerror("Error", f"Failed to upload to cloud: {str(e)}")
@@ -694,7 +678,6 @@ class CloudImageApp:
         self.image_processed = False
         self.rectangles = []
         if self.image_index >= len(self.image_list):
-            # full scan for unannotated images
             for i, image_info in enumerate(self.image_list):
                 self.current_image_info = image_info
                 if not self.check_existing_annotations():
@@ -739,17 +722,38 @@ class CloudImageApp:
 
     def create_or_get_mouse_folder(self, mouse_name, parent_folder_id):
         try:
-            query = f"name='{mouse_name}' and '{parent_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
-            existing = self.list_all_files(q=query, fields="files(id)")
-            if existing:
-                return existing[0]['id']
-            folder_metadata = {
-                'name': mouse_name,
-                'mimeType': 'application/vnd.google-apps.folder',
-                'parents': [parent_folder_id]
-            }
-            folder = self.drive_service.files().create(body=folder_metadata, fields='id').execute()
-            return folder['id']
+            mouse_query = f"name='{mouse_name}' and '{parent_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+            existing_mouse = self.list_all_files(q=mouse_query, fields="files(id)")
+            if existing_mouse:
+                mouse_folder_id = existing_mouse[0]['id']
+            else:
+                folder_metadata = {
+                    'name': mouse_name,
+                    'mimeType': 'application/vnd.google-apps.folder',
+                    'parents': [parent_folder_id]
+                }
+                mouse_folder = self.drive_service.files().create(body=folder_metadata, fields='id').execute()
+                mouse_folder_id = mouse_folder['id']
+            coords_query = f"name='coords' and '{mouse_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+            existing_coords = self.list_all_files(q=coords_query, fields="files(id)")
+            if not existing_coords:
+                coords_metadata = {
+                    'name': 'coords',
+                    'mimeType': 'application/vnd.google-apps.folder',
+                    'parents': [mouse_folder_id]
+                }
+                self.drive_service.files().create(body=coords_metadata, fields='id').execute()
+            if self.upload_images:
+                images_query = f"name='images' and '{mouse_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+                existing_images = self.list_all_files(q=images_query, fields="files(id)")
+                if not existing_images:
+                    images_metadata = {
+                        'name': 'images',
+                        'mimeType': 'application/vnd.google-apps.folder',
+                        'parents': [mouse_folder_id]
+                    }
+                    self.drive_service.files().create(body=images_metadata, files='id').execute()
+            return mouse_folder_id
         except Exception as e:
             messagebox.showerror("Error", f"Failed to create mouse folder: {str(e)}")
             raise
@@ -890,18 +894,17 @@ class CloudImageApp:
                 except tk.TclError:
                     pass
                 except Exception as e:
-                    print(f"Failed to clear widget {widget_name}: {str(e)}")
+                    logging.error(f"Failed to clear widget {widget_name}: {str(e)}")
                 finally:
                     if hasattr(self, widget_name):
                         delattr(self, widget_name)
 
     def cleanup(self):
         try:
-            # Recursively delete all files and subdirectories in temp_dir
             if os.path.exists(self.temp_dir):
                 shutil.rmtree(self.temp_dir, ignore_errors=True)
         except Exception as e:
-            print(f"Cleanup failed: {str(e)}")
+            logging.error(f"Cleanup failed: {str(e)}")
 
     def on_close(self):
         self.save_state()
@@ -909,6 +912,7 @@ class CloudImageApp:
         self.root.quit()
 
     def generate_variability_plots(self):
+        logger = logging.getLogger(__name__)
         try:
             temp_dir = tempfile.mkdtemp()
             observers = self.get_observers_from_drive()
@@ -925,18 +929,26 @@ class CloudImageApp:
                     f"Need at least {self.interobplt_thresh} common images for comparison. Found {len(common_images)} common images."
                 )
                 return
-            self.process_observer_data(observers, common_images, temp_dir)
-            image_files = self.generate_visualizations(temp_dir)
+            self.download_all_coords(observers, common_images, temp_dir)
+            image_files = self.generate_visualizations(temp_dir, observers, common_images)
+            if not image_files:
+                messagebox.showwarning("Warning", "No variability plots generated. Check if coordinate files contain valid annotations.")
+                return
             self.display_plots_window(image_files)
             messagebox.showinfo(
                 "Success", 
                 f"Generated variability plots for {len(observers)} observers and {len(common_images)} common images."
             )
         except Exception as e:
+            logger.error(f"Failed to generate plots: {str(e)}")
             messagebox.showerror("Error", f"Failed to generate plots: {str(e)}")
         finally:
             if os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir)
+                try:
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                except Exception as e:
+                    logger.error(f"Failed to clean up temp_dir: {str(e)}")
+
 
     def get_observers_from_drive(self):
         try:
@@ -944,25 +956,20 @@ class CloudImageApp:
             folders = self.list_all_files(q=query, fields="files(name,id)")
             return [folder['name'] for folder in folders]
         except Exception as e:
-            print(f"Failed to get observers: {str(e)}")
+            logging.error(f"Failed to get observers: {str(e)}")
             return []
 
     def find_common_images(self, observers):
         try:
-            print("Building file cache from Google Drive. This may take a moment...")
+            logger = logging.getLogger(__name__)
+            logger.info("Building file cache from Google Drive. This may take a moment...")
             self.folder_id_cache.clear()
-            
-            # 1. Get all observer folders and cache their IDs
             observer_folders_query = f"'{self.output_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
             all_observer_folders = self.list_all_files(q=observer_folders_query, fields="files(id, name)")
-
-            # Filter for the observers we are actually comparing
             observer_folder_map = {f['name']: f['id'] for f in all_observer_folders if f['name'] in observers}
-
+            
             for observer_name, observer_id in observer_folder_map.items():
                 self.folder_id_cache[observer_name] = {}
-                
-                # 2. For each observer, get all mouse folders
                 mouse_folders_query = f"'{observer_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
                 all_mouse_folders = self.list_all_files(q=mouse_folders_query, fields="files(id, name)")
                 
@@ -970,99 +977,106 @@ class CloudImageApp:
                     mouse_name = mouse_folder['name']
                     mouse_id = mouse_folder['id']
                     self.folder_id_cache[observer_name][mouse_name] = {'folder_id': mouse_id, 'files': {}}
-                    
-                    # 3. For each mouse folder, get all coordinate files
-                    coord_files_query = f"'{mouse_id}' in parents and name contains '_coords.txt' and trashed=false"
-                    all_coord_files = self.list_all_files(q=coord_files_query, fields="files(id, name)")
-                    
-                    for coord_file in all_coord_files:
-                        self.folder_id_cache[observer_name][mouse_name]['files'][coord_file['name']] = coord_file['id']
+                    coords_query = f"name='coords' and '{mouse_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+                    coords_folders = self.list_all_files(q=coords_query, fields="files(id)")
+                    if not coords_folders:
+                        logger.warning(f"No 'coords' folder found in {observer_name}/{mouse_name}. Skipping.")
+                        continue
+                    coords_id = coords_folders[0]['id']
+                    coord_files_query = f"'{coords_id}' in parents and title contains '_coords.txt' and trashed=false"
+                    try:
+                        all_coord_files = self.pydrive.ListFile({'q': coord_files_query}).GetList()
+                        for coord_file in all_coord_files:
+                            self.folder_id_cache[observer_name][mouse_name]['files'][coord_file['title']] = coord_file['id']
+                    except Exception as e:
+                        logger.error(f"Failed to list coordinate files in {observer_name}/{mouse_name}/coords: {str(e)}")
+                        continue
             
-            print("Cache built successfully.")
-            
-            # 4. Find common images using the local cache (much faster)
+            logger.info("Cache built successfully.")
             if not self.folder_id_cache:
+                logger.warning("No data in folder_id_cache. Returning empty common images.")
                 return []
-
-            # Find mice common to all observers
+            
             first_observer_mice = set(self.folder_id_cache[observers[0]].keys())
             common_mice = first_observer_mice.intersection(*(set(self.folder_id_cache[obs].keys()) for obs in observers[1:]))
-
             common_images = []
+            seen_images = set()  # Track unique (mouse, image_name) pairs
             for mouse in common_mice:
-                # Get file list for the first observer for this mouse
                 first_observer_files = set(self.folder_id_cache[observers[0]][mouse]['files'].keys())
-                
-                # Find the intersection with all other observers' files for the same mouse
                 common_files = first_observer_files.intersection(*(set(self.folder_id_cache[obs][mouse]['files'].keys()) for obs in observers[1:]))
-                
                 for coord_file in common_files:
                     image_name = coord_file.replace('_coords.txt', '')
-                    common_images.append((mouse, image_name))
+                    image_key = (mouse, image_name)
+                    if image_key not in seen_images:
+                        common_images.append(image_key)
+                        seen_images.add(image_key)
             
-            print(f"Found {len(common_images)} common images across {len(observers)} observers.")
+            logger.info(f"Found {len(common_images)} common images across {len(observers)} observers.")
             return common_images
         except Exception as e:
-            print(f"Failed to find common images: {str(e)}")
-            messagebox.showerror("Error", f"Failed to find common images: {e}")
+            logger.error(f"Failed to find common images: {str(e)}")
+            messagebox.showerror("Error", f"Failed to find common images: {str(e)}")
             return []
+
+    def download_all_coords(self, observers, common_images, temp_dir):
+        logger = logging.getLogger(__name__)
+        def download_file(file, local_path):
+            try:
+                file.GetContentFile(local_path)
+            except Exception as e:
+                logger.error(f"Failed to download {file['title']} to {local_path}: {str(e)}")
+                with open(local_path, 'w') as f:
+                    pass
+        
+        download_tasks = []
+        for observer in observers:
+            observer_dir = os.path.join(temp_dir, observer)
+            os.makedirs(observer_dir, exist_ok=True)
+            for mouse, image_name in common_images:
+                coord_name = f"{os.path.splitext(image_name)[0]}_coords.txt"
+                local_coord_path = os.path.join(observer_dir, mouse, coord_name)
+                os.makedirs(os.path.join(observer_dir, mouse), exist_ok=True)
+                file_id = self.folder_id_cache.get(observer, {}).get(mouse, {}).get('files', {}).get(coord_name)
+                if file_id:
+                    file = self.pydrive.CreateFile({'id': file_id})
+                    download_tasks.append((file, local_coord_path))
+                else:
+                    logger.warning(f"No coord file '{coord_name}' for {observer}/{mouse}. Creating empty file.")
+                    with open(local_coord_path, 'w') as f:
+                        pass
+        
+        with ThreadPoolExecutor(max_workers=100) as executor:
+            executor.map(lambda task: download_file(task[0], task[1]), download_tasks)
+        import gc
+        gc.collect()
 
     def image_exists_for_observer(self, observer, mouse, image_name):
         try:
-            query = f"name='{observer}' and '{self.output_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
-            observer_folder = self.list_all_files(q=query, fields="files(id)")
-            if not observer_folder:
+            observer_folder_id = self.folder_id_cache.get(observer, {}).get('folder_id')
+            if not observer_folder_id:
+                query = f"name='{observer}' and '{self.output_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+                observer_folder = self.list_all_files(q=query, fields="files(id)")
+                if not observer_folder:
+                    return False
+                observer_folder_id = observer_folder[0]['id']
+            mouse_folder_id = self.folder_id_cache.get(observer, {}).get(mouse, {}).get('folder_id')
+            if not mouse_folder_id:
+                query = f"name='{mouse}' and '{observer_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+                mouse_folder = self.list_all_files(q=query, fields="files(id)")
+                if not mouse_folder:
+                    return False
+                mouse_folder_id = mouse_folder[0]['id']
+            images_query = f"name='images' and '{mouse_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+            images_folders = self.list_all_files(q=images_query, fields="files(id)")
+            if not images_folders:
                 return False
-            observer_folder_id = observer_folder[0]['id']
-            query = f"name='{mouse}' and '{observer_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
-            mouse_folder = self.list_all_files(q=query, fields="files(id)")
-            if not mouse_folder:
-                return False
-            mouse_folder_id = mouse_folder[0]['id']
-            query = f"name='{image_name}' and '{mouse_folder_id}' in parents and trashed=false"
+            images_folder_id = images_folders[0]['id']
+            query = f"name='{image_name}' and '{images_folder_id}' in parents and trashed=false"
             images = self.list_all_files(q=query, fields="files(id)")
             return len(images) > 0
         except Exception as e:
-            print(f"Failed to check image existence: {str(e)}")
+            logging.error(f"Failed to check image existence: {str(e)}")
             return False
-
-    def process_observer_data(self, observers, common_images, temp_dir):
-        try:
-            # Create local directories for each observer
-            for observer in observers:
-                os.makedirs(os.path.join(temp_dir, observer), exist_ok=True)
-            
-            # Download only the coordinate files for each common image
-            for mouse, image_name in common_images:
-                coord_name = f"{os.path.splitext(image_name)[0]}_coords.txt"
-                for observer in observers:
-                    local_coord_path = os.path.join(temp_dir, observer, coord_name)
-                    # This function will now use the cache
-                    self.download_observer_files(observer, mouse, coord_name, local_coord_path)
-        except Exception as e:
-            print(f"Failed to process observer data: {str(e)}")
-            raise
-
-    def download_observer_files(self, observer, mouse, coord_name, coord_path):
-        try:
-            # Directly get the file ID from the cache, avoiding API searches
-            file_id = self.folder_id_cache.get(observer, {}).get(mouse, {}).get('files', {}).get(coord_name)
-            
-            if file_id:
-                self.download_from_drive(file_id, coord_path)
-            else:
-                # If the file isn't in the cache, it doesn't exist for this observer.
-                # Create an empty file locally to ensure the process doesn't fail.
-                with open(coord_path, 'w') as f:
-                    pass
-                print(f"Note: No coord file '{coord_name}' for {observer}/{mouse}. Creating empty file.")
-
-        except Exception as e:
-            print(f"Failed to download file '{coord_name}' for {observer}: {str(e)}")
-            # Ensure an empty file exists on failure to prevent crashes later
-            if not os.path.exists(coord_path):
-                with open(coord_path, 'w') as f:
-                    pass
 
     def calculate_iou(self, box1, box2):
         x1, y1, x2, y2 = box1
@@ -1081,14 +1095,11 @@ class CloudImageApp:
             return 0.0
         return inter_area / union_area
 
-    def generate_visualizations(self, temp_dir):
+    def generate_visualizations(self, temp_dir, observers, common_images):
+        logger = logging.getLogger(__name__)
         try:
             viz_dir = os.path.join(temp_dir, "visualizations")
             os.makedirs(viz_dir, exist_ok=True)
-            observers = [
-                d for d in os.listdir(temp_dir)
-                if os.path.isdir(os.path.join(temp_dir, d)) and d != "visualizations"
-            ]
             if len(observers) < 2:
                 raise ValueError("Need at least 2 observers for comparison")
             class_mapping = {
@@ -1102,87 +1113,91 @@ class CloudImageApp:
                 observers[1]: "#84C5A1"
             }
             image_files = []
-            mouse_conditions = set()
-            for observer in observers:
-                observer_dir = os.path.join(temp_dir, observer)
-                for file in os.listdir(observer_dir):
-                    if file.endswith('_coords.txt'):
-                        mouse = file.split('_')[0]
-                        mouse_conditions.add(mouse)
-            for mouse in mouse_conditions:
-                for feature in class_mapping.keys():
-                    plot_data = []
-                    image_files_list = []
+            for feature in class_mapping.keys():
+                plot_data = []
+                for mouse, image_name in common_images:
+                    observer_boxes = {}
                     for observer in observers:
-                        observer_dir = os.path.join(temp_dir, observer)
-                        for file in os.listdir(observer_dir):
-                            if file.startswith(mouse) and file.endswith('_coords.txt'):
-                                image_files_list.append(file)
-                    for coord_file in set(image_files_list):
-                        image_name = coord_file.replace('_coords.txt', '')
-                        observer_boxes = {}
-                        for observer in observers:
-                            coord_path = os.path.join(temp_dir, observer, coord_file)
-                            boxes = []
-                            if os.path.exists(coord_path):
+                        coord_path = os.path.join(temp_dir, observer, mouse, f"{os.path.splitext(image_name)[0]}_coords.txt")
+                        boxes = []
+                        if os.path.exists(coord_path):
+                            try:
                                 with open(coord_path, 'r') as f:
-                                    for line in f:
+                                    lines = f.readlines()
+                                    if not lines:
+                                        logger.warning(f"Empty coordinate file: {coord_path}")
+                                        continue
+                                    for line in lines:
                                         parts = line.strip().split(',')
                                         if len(parts) >= 5 and parts[4] == feature:
-                                            x1, y1, x2, y2 = map(int, parts[:4])
-                                            boxes.append([x1, y1, x2, y2])
-                            observer_boxes[observer] = boxes
-                        if not all(observer_boxes[obs] for obs in observers):
-                            common_count = 0
-                        else:
-                            common_boxes = observer_boxes[observers[0]].copy()
-                            matched_indices = {obs: [False] * len(observer_boxes[obs]) for obs in observers}
-                            for i in range(1, len(observers)):
-                                current_observer = observers[i]
-                                new_common_boxes = []
-                                matched_indices[current_observer] = [False] * len(observer_boxes[current_observer])
-                                for box1 in common_boxes:
-                                    best_iou = 0.1
-                                    best_match = None
-                                    best_idx = None
-                                    for j, box2 in enumerate(observer_boxes[current_observer]):
-                                        if not matched_indices[current_observer][j]:
-                                            iou = self.calculate_iou(box1, box2)
-                                            if iou > best_iou:
-                                                best_iou = iou
-                                                best_match = box2
-                                                best_idx = j
-                                    if best_match:
-                                        avg_box = [
-                                            (box1[0] + best_match[0]) / 2,
-                                            (box1[1] + best_match[1]) / 2,
-                                            (box1[2] + best_match[2]) / 2,
-                                            (box1[3] + best_match[3]) / 2
-                                        ]
-                                        new_common_boxes.append(avg_box)
-                                        matched_indices[current_observer][best_idx] = True
-                                common_boxes = new_common_boxes
-                            common_count = len(common_boxes)
-                        counts = {observer: len(observer_boxes[observer]) for observer in observers}
-                        print(f"Image: {image_name}, Feature: {feature}, Counts: {counts}, Common: {common_count}")
-                        plot_data.append({
-                            'Image': image_name,
-                            **counts,
-                            'Common': common_count
-                        })
-                    df = pd.DataFrame(plot_data)
-                    if df['Common'].sum() == 0:
-                        print(f"Warning: No common annotations for {feature} in {mouse}. Check coordinate files.")
-                    image_path = self.create_variability_plot(
-                        df, mouse, feature, observers, color_mapping, viz_dir
-                    )
-                    image_files.append((feature, image_path))
+                                            try:
+                                                x1, y1, x2, y2 = map(int, parts[:4])
+                                                boxes.append([x1, y1, x2, y2])
+                                            except ValueError:
+                                                logger.error(f"Invalid coordinate format in {coord_path}: {line}")
+                                                continue
+                            except Exception as e:
+                                logger.error(f"Failed to read {coord_path}: {str(e)}")
+                                continue
+                        observer_boxes[observer] = boxes
+                    if not all(observer_boxes.get(obs) for obs in observers):
+                        common_count = 0
+                    else:
+                        common_boxes = observer_boxes[observers[0]].copy()
+                        matched_indices = {obs: [False] * len(observer_boxes[obs]) for obs in observers}
+                        for i in range(1, len(observers)):
+                            current_observer = observers[i]
+                            new_common_boxes = []
+                            matched_indices[current_observer] = [False] * len(observer_boxes[current_observer])
+                            for box1 in common_boxes:
+                                best_iou = 0.1
+                                best_match = None
+                                best_idx = None
+                                for j, box2 in enumerate(observer_boxes[current_observer]):
+                                    if not matched_indices[current_observer][j]:
+                                        iou = self.calculate_iou(box1, box2)
+                                        if iou > best_iou:
+                                            best_iou = iou
+                                            best_match = box2
+                                            best_idx = j
+                                if best_match:
+                                    avg_box = [
+                                        (box1[0] + best_match[0]) / 2,
+                                        (box1[1] + best_match[1]) / 2,
+                                        (box1[2] + best_match[2]) / 2,
+                                        (box1[3] + best_match[3]) / 2
+                                    ]
+                                    new_common_boxes.append(avg_box)
+                                    matched_indices[current_observer][best_idx] = True
+                            common_boxes = new_common_boxes
+                        common_count = len(common_boxes)
+                    counts = {observer: len(observer_boxes.get(observer, [])) for observer in observers}
+                    plot_data.append({
+                        'Image': f"{mouse}/{image_name}",
+                        **counts,
+                        'Common': common_count
+                    })
+                if not plot_data:
+                    logger.warning(f"No plot data for {feature}. Skipping.")
+                    continue
+                df = pd.DataFrame(plot_data)
+                if df.empty or df['Common'].sum() == 0:
+                    logger.warning(f"No valid annotations for {feature}")
+                    continue
+                image_path = self.create_variability_plot(
+                    df, "All Mice", feature, observers, color_mapping, viz_dir
+                )
+                image_files.append((feature, image_path))
+                del df
+                import gc
+                gc.collect()
             return image_files
         except Exception as e:
-            print(f"Failed to generate visualizations: {str(e)}")
+            logger.error(f"Failed to generate visualizations: {str(e)}")
             raise
 
     def create_variability_plot(self, df, mouse, feature, observers, color_mapping, viz_dir):
+        logger = logging.getLogger(__name__)
         try:
             df['Total'] = df[observers].sum(axis=1) + df['Common']
             for observer in observers:
@@ -1219,7 +1234,7 @@ class CloudImageApp:
                     text=df[observer].round(1).astype(str) + '%',
                     textposition='inside'
                 ))
-            title = f"<b>Inter-Observer Variability of {feature} Counts in {mouse} Tiles</b>"
+            title = f"<b>Inter-Observer Variability of {feature} Counts Across All Mice</b>"
             fig.update_layout(
                 barmode='stack',
                 title=title,
@@ -1235,12 +1250,15 @@ class CloudImageApp:
                 width=1200,
                 height=600
             )
-            viz_filename = f"inter_observer_{mouse}_{feature.replace(' ', '_')}.png"
+            viz_filename = f"inter_observer_{feature.replace(' ', '_')}.png"
             viz_path = os.path.join(viz_dir, viz_filename)
             fig.write_image(viz_path, format="png")
+            del fig
+            import gc
+            gc.collect()
             return viz_path
         except Exception as e:
-            print(f"Failed to create variability plot: {str(e)}")
+            logger.error(f"Failed to create variability plot: {str(e)}")
             raise
 
     def display_plots_window(self, image_files):

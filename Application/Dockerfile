@@ -1,27 +1,26 @@
-# Use an official Python runtime as a parent image
-FROM python:3.8-slim
+FROM python:3.11-slim
 
-# Set the working directory in the container
+LABEL org.opencontainers.image.title="LungInsight Annotator" \
+      org.opencontainers.image.description="Lung histology tile annotator with Google Drive sync" \
+      org.opencontainers.image.version="1.7"
+
 WORKDIR /app
 
-# Install system packages required by tkinter, OpenCV, and OpenSSL
-RUN apt-get update && apt-get install -y \
+# tkinter, OpenCV, Plotly/Kaleido, OpenSSL
+RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-tk \
-    libsm6 libxext6 libxrender-dev libgl1-mesa-glx libglib2.0-0 libssl-dev \
+    libsm6 libxext6 libxrender-dev libgl1 libglib2.0-0 libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy the current directory contents into the container at /app
-COPY . /app
-
-COPY lunginsightcloud-fa31002e7988.json /app/lunginsightcloud-fa31002e7988.json
-
-# Install any needed packages specified in requirements.txt
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-RUN mkdir -p /app/visualizations && chmod -R 777 /app/visualizations
 
-# Create a non-root user for security
-RUN useradd -m appuser
+COPY . /app
+RUN test -f /app/lunginsightcloud-fa31002e7988.json
+
+RUN useradd -m appuser && chown -R appuser:appuser /app
 USER appuser
 
-# Run your program when the container launches
+ENV DISPLAY=:0
+
 CMD ["python", "Application.py"]

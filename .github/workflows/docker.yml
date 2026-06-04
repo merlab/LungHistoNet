@@ -1,0 +1,36 @@
+name: Build and push Docker image
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Write Google service account credentials
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          if [ -z "$GOOGLE_SERVICE_ACCOUNT_JSON" ]; then
+            echo "GOOGLE_SERVICE_ACCOUNT_JSON secret is not set; skipping image build."
+            exit 1
+          fi
+          printf '%s' "$GOOGLE_SERVICE_ACCOUNT_JSON" > Application/lunginsightcloud-fa31002e7988.json
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: ./Application
+          push: true
+          tags: |
+            amirhosseinebrahimi/lung-injury:latest_v1.7
+            amirhosseinebrahimi/lung-injury:${{ github.ref_name }}

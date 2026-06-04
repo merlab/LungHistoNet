@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Launch LungInsight annotator (Linux). macOS: see README for socat + docker compose.mac.yml
+set -euo pipefail
+IMAGE="${LUNGINJURY_IMAGE:-amirhosseinebrahimi/lung-injury:latest_v1.7}"
+REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
+
+if [[ "$(uname -s)" == "Linux" ]]; then
+  if command -v xhost >/dev/null 2>&1; then
+    xhost +local:docker >/dev/null 2>&1 || sudo xhost +local:docker
+  fi
+  exec docker compose -f "${REPO_ROOT}/docker-compose.yml" run --rm app
+else
+  echo "On macOS, run: docker compose -f docker-compose.mac.yml run --rm app"
+  echo "(Start socat in another terminal first — see README.md)"
+  exit 1
+fi

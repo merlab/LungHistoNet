@@ -1,0 +1,12 @@
+# macOS: run socat in a separate terminal first (see README), then:
+#   docker compose -f docker-compose.mac.yml run --rm app
+services:
+  app:
+    image: amirhosseinebrahimi/lung-injury:latest_v1.7
+    build:
+      context: ./Application
+      dockerfile: Dockerfile
+    stdin_open: true
+    tty: true
+    environment:
+      DISPLAY: host.docker.internal:0

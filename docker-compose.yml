@@ -1,0 +1,13 @@
+# Linux: allow X11 from Docker, then: docker compose run --rm app
+services:
+  app:
+    image: amirhosseinebrahimi/lung-injury:latest_v1.7
+    build:
+      context: ./Application
+      dockerfile: Dockerfile
+    stdin_open: true
+    tty: true
+    environment:
+      DISPLAY: ${DISPLAY:-:0}
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix

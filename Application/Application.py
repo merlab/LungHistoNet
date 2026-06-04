@@ -7,9 +7,13 @@ import numpy as np
 import pandas as pd
 import tempfile
 import io
+import webbrowser
+from datetime import datetime
 from io import BytesIO
 import plotly.graph_objects as go
+import plotly.io as pio
 from concurrent.futures import ThreadPoolExecutor
+from ui_shell import LungInsightUIMixin, BRAND, PLOT_COLORS
 from pydrive2.auth import GoogleAuth
 from pydrive2.drive import GoogleDrive
 from oauth2client.service_account import ServiceAccountCredentials
@@ -21,11 +25,18 @@ import shutil
 import uuid
 import logging
 
-class CloudImageApp:
+class CloudImageApp(LungInsightUIMixin):
     def __init__(self, root):
         self.root = root
-        self.root.title("Cloud-Based Lung Injury Analysis")
+        self.configure_root_window()
+        self.setup_theme()
         self.feature_type = tk.StringVar(value="Neutrophils")
+        self.feature_type.trace_add("write", lambda *_: self._on_feature_changed())
+        self.last_save_time = None
+        self.edit_zoom = 1.0
+        self.edit_pan_x = 0
+        self.edit_pan_y = 0
+        self._pan_start = None
         self.feature_colors = {
             "Neutrophils": (0, 255, 0),
             "Hyaline Membranes": (255, 0, 0),
@@ -63,14 +74,20 @@ class CloudImageApp:
         self.final_dir = os.path.join(self.temp_dir, "final")
         self.state_dir = os.path.join(self.temp_dir, "state")
         self.coords_dir = os.path.join(self.temp_dir, "coordinates")
-        self.main_frame = ttk.Frame(root)
-        self.main_frame.pack(fill=tk.BOTH, expand=True)
         os.makedirs(self.processed_dir, exist_ok=True)
         os.makedirs(self.final_dir, exist_ok=True)
         os.makedirs(self.state_dir, exist_ok=True)
         os.makedirs(self.coords_dir, exist_ok=True)
+        self.build_app_shell()
+        self.bind_shortcuts()
         self.setup_initial_ui()
-        self.load_cloud_images()
+        self.show_loading("Loading image list from Google Drive…")
+        self.root.update_idletasks()
+        try:
+            self.load_cloud_images()
+        finally:
+            self.hide_loading()
+        self.set_status("Connected to Google Drive")
         if self.load_state():
             if self.image_index >= len(self.image_list):
                 self.image_index = 0
@@ -82,6 +99,21 @@ class CloudImageApp:
             messagebox.showerror("Error", "No images found in cloud folder")
             self.root.quit()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.update_chrome()
+
+    def _on_feature_changed(self):
+        if hasattr(self, "status_var"):
+            self._update_feature_status()
+
+    def _event_to_image_coords(self, x, y):
+        zoom = self.edit_zoom
+        cx = (x - self.edit_pan_x) / zoom
+        cy = (y - self.edit_pan_y) / zoom
+        image = cv2.imread(os.path.join(self.processed_dir, self.current_image_info["name"]))
+        original_height, original_width = image.shape[:2]
+        scale_x = original_width / 1280
+        scale_y = original_height / 512
+        return int(cx * scale_x), int(cy * scale_y)
 
     def initialize_pydrive(self):
         gauth = GoogleAuth()
@@ -90,28 +122,17 @@ class CloudImageApp:
         return GoogleDrive(gauth)
 
     def setup_initial_ui(self):
-        for widget in self.main_frame.winfo_children():
+        for widget in self.sidebar_inner.winfo_children():
             widget.destroy()
-        self.image_label = ttk.Label(self.main_frame)
-        self.image_label.pack(pady=10)
-        self.feature_frame = ttk.Frame(self.main_frame)
-        self.feature_frame.pack(pady=5)
-        ttk.Label(self.feature_frame, text="Feature:").pack(side=tk.LEFT)
-        ttk.Radiobutton(self.feature_frame, text="Neutrophils", variable=self.feature_type, 
-                        value="Neutrophils").pack(side=tk.LEFT, padx=5)
-        ttk.Radiobutton(self.feature_frame, text="Hyaline Membranes", variable=self.feature_type,
-                        value="Hyaline Membranes").pack(side=tk.LEFT, padx=5)
-        ttk.Radiobutton(self.feature_frame, text="Proteinaceous Debris", variable=self.feature_type,
-                        value="Proteinaceous Debris").pack(side=tk.LEFT, padx=5)
-        self.button_frame = ttk.Frame(self.main_frame)
-        self.button_frame.pack(pady=5)
-        self.continue_button = ttk.Button(self.button_frame, text="Process", command=self.on_continue)
-        self.next_button = ttk.Button(self.button_frame, text="Next Image", command=self.load_next_image)
-        self.variability_button = ttk.Button(self.button_frame, text="Inter-Observer Variability Plot", 
-                                             command=self.generate_variability_plots)
-        self.continue_button.pack(side=tk.LEFT, padx=5)
-        self.next_button.pack(side=tk.LEFT, padx=5)
-        self.variability_button.pack(side=tk.LEFT, padx=5)
+        for widget in self.content_frame.winfo_children():
+            if widget != self.loading_frame:
+                widget.destroy()
+        self.build_feature_chips(self.sidebar_inner)
+        self.build_toolbar(self.sidebar_inner)
+        self._highlight_feature_chip()
+        self.image_label = ttk.Label(self.content_frame)
+        self.image_label.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        self.edit_mode = False
 
     def save_final_image(self):
         try:
@@ -133,28 +154,59 @@ class CloudImageApp:
                 self.clear_edit_widgets()
                 self.setup_initial_ui()
                 self.display_image(final_path)
+                self.last_save_time = datetime.now()
+                self.set_status(f"Edits saved at {self.last_save_time.strftime('%H:%M:%S')}")
+                self.update_chrome()
             else:
                 messagebox.showerror("Error", "No source image found.")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to save edited image: {str(e)}")
 
     def setup_edit_ui(self):
-        for widget in self.main_frame.winfo_children():
+        for widget in self.sidebar_inner.winfo_children():
             widget.destroy()
-        self.mode_label_name = ttk.Entry(self.main_frame, width=50)
+        for widget in self.content_frame.winfo_children():
+            if widget != self.loading_frame:
+                widget.destroy()
+        self.edit_mode = True
+        self.edit_zoom = 1.0
+        self.edit_pan_x = 0
+        self.edit_pan_y = 0
+        ttk.Label(self.sidebar_inner, text="Edit mode", style="SidebarTitle.TLabel").pack(anchor=tk.W, pady=(8, 4))
+        self.mode_label_name = ttk.Entry(self.sidebar_inner, width=28)
         self.mode_label_name.insert(0, f"{self.current_image_info['name']}")
-        self.mode_label_name.config(state='readonly')
-        self.mode_label_name.pack()
-        self.mode_label = ttk.Label(self.main_frame, text="Mode:")
-        self.mode_label.pack()
-        self.add_radio = ttk.Radiobutton(self.main_frame, text="Add", variable=self.mode, value="Add", command=self.update_mode)
-        self.remove_radio = ttk.Radiobutton(self.main_frame, text="Remove", variable=self.mode, value="Remove", command=self.update_mode)
-        self.add_radio.pack()
-        self.remove_radio.pack()
-        self.edit_canvas = tk.Canvas(self.main_frame, width=1280, height=512, bg="gray")
-        self.edit_canvas.pack()
-        self.finalize_button = ttk.Button(self.main_frame, text="Save", command=self.save_final_image)
-        self.finalize_button.pack(pady=5)
+        self.mode_label_name.config(state="readonly")
+        self.mode_label_name.pack(fill=tk.X, pady=4)
+        ttk.Label(self.sidebar_inner, text="Mode", style="SidebarTitle.TLabel").pack(anchor=tk.W, pady=(8, 2))
+        self.add_radio = ttk.Radiobutton(
+            self.sidebar_inner, text="Add (draw box)", variable=self.mode, value="Add", command=self.update_mode
+        )
+        self.remove_radio = ttk.Radiobutton(
+            self.sidebar_inner, text="Remove (click box)", variable=self.mode, value="Remove", command=self.update_mode
+        )
+        self.add_radio.pack(anchor=tk.W)
+        self.remove_radio.pack(anchor=tk.W, pady=(0, 8))
+        self.build_feature_chips(self.sidebar_inner)
+        ttk.Label(self.sidebar_inner, text="Scroll wheel: zoom · Middle-drag: pan", font=(self.ui_font[0], 9)).pack(
+            anchor=tk.W, pady=4
+        )
+        self.finalize_button = ttk.Button(
+            self.sidebar_inner, text="Save edits (S)", command=self.save_final_image, style="Accent.TButton"
+        )
+        self.finalize_button.pack(fill=tk.X, pady=8)
+        canvas_frame = ttk.Frame(self.content_frame)
+        canvas_frame.pack(fill=tk.BOTH, expand=True)
+        self.edit_canvas = tk.Canvas(
+            canvas_frame, width=1280, height=512, bg="#F1F5F9",
+            highlightthickness=1, highlightbackground="#94A3B8", cursor="crosshair"
+        )
+        self.edit_canvas.pack(padx=8, pady=8)
+        self.edit_canvas.bind("<MouseWheel>", self._on_edit_wheel)
+        self.edit_canvas.bind("<Button-2>", self._on_pan_start)
+        self.edit_canvas.bind("<B2-Motion>", self._on_pan_move)
+        self.edit_canvas.bind("<ButtonRelease-2>", self._on_pan_end)
+        self.edit_canvas.bind("<Button-4>", lambda e: self._on_edit_wheel_delta(1))
+        self.edit_canvas.bind("<Button-5>", lambda e: self._on_edit_wheel_delta(-1))
 
     def save_state(self):
         try:
@@ -193,22 +245,6 @@ class CloudImageApp:
             messagebox.showerror("Authentication Error", f"Failed to initialize Google Drive service: {str(e)}")
             self.root.quit()
             raise
-
-    def get_username(self):
-        dialog = tk.Toplevel(self.root)
-        dialog.title("User Identification")
-        dialog.geometry("300x150")
-        tk.Label(dialog, text="Please enter your name:").pack(pady=10)
-        entry = tk.Entry(dialog)
-        entry.pack(pady=5)
-        result = []
-        def on_ok():
-            username = entry.get().strip().lower()
-            result.append(username)
-            dialog.destroy()
-        tk.Button(dialog, text="Submit", command=on_ok).pack(pady=10)
-        dialog.wait_window()
-        return result[0] if result else None
 
     def load_state(self):
         try:
@@ -428,7 +464,14 @@ class CloudImageApp:
         self.current_image_info = self.image_list[self.image_index]
         temp_image_path = os.path.join(self.temp_dir, self.current_image_info['name'])
         self.feature_type.set("Neutrophils")
-        if self.download_from_drive(self.current_image_info['id'], temp_image_path):
+        self._highlight_feature_chip()
+        self.show_loading("Downloading tile…")
+        self.root.update_idletasks()
+        try:
+            ok = self.download_from_drive(self.current_image_info['id'], temp_image_path)
+        finally:
+            self.hide_loading()
+        if ok:
             self.current_image_path = temp_image_path
             self.display_image(temp_image_path)
             coord_name = f"{os.path.splitext(self.current_image_info['name'])[0]}_coords.txt"
@@ -438,18 +481,28 @@ class CloudImageApp:
             files = self.list_all_files(q=query, fields="files(id)")
             if files:
                 coord_path = os.path.join(self.coords_dir, coord_name)
-                if self.download_from_drive(files[0]['id'], coord_path):
-                    self.rectangles = self.load_coordinates(self.current_image_info['name'])
+                self.show_loading("Downloading coordinates…")
+                self.root.update_idletasks()
+                try:
+                    if self.download_from_drive(files[0]['id'], coord_path):
+                        self.rectangles = self.load_coordinates(self.current_image_info['name'])
+                finally:
+                    self.hide_loading()
+            self.update_chrome()
+            self.set_status(f"Loaded {self.current_image_info['name']}")
         else:
             messagebox.showerror("Error", f"Failed to download image: {self.current_image_info['name']}")
 
     def display_image(self, image_path):
         try:
             image = Image.open(image_path)
-            image = image.resize((1280, 512))
+            max_w = max(self.content_frame.winfo_width() - 32, 900)
+            max_h = max(self.content_frame.winfo_height() - 32, 400)
+            image.thumbnail((max_w, max_h), Image.LANCZOS)
             self.image_tk = ImageTk.PhotoImage(image)
-            if hasattr(self, 'image_label') and self.image_label.winfo_exists():
+            if hasattr(self, "image_label") and self.image_label.winfo_exists():
                 self.image_label.config(image=self.image_tk)
+            self.update_chrome()
         except Exception as e:
             messagebox.showerror("Error", f"Failed to display image: {str(e)}")
 
@@ -609,10 +662,12 @@ class CloudImageApp:
     def show_post_processing_options(self):
         self.continue_button.pack_forget()
         self.next_button.pack_forget()
-        self.save_button = ttk.Button(self.button_frame, text="Save", command=self.on_save)
-        self.edit_button = ttk.Button(self.button_frame, text="Edit", command=self.on_edit)
-        self.save_button.pack(side=tk.LEFT, padx=5)
-        self.edit_button.pack(side=tk.RIGHT, padx=5)
+        self.variability_button.pack_forget()
+        self.save_button = ttk.Button(self.button_frame, text="Save (S)", command=self.on_save, style="Accent.TButton")
+        self.edit_button = ttk.Button(self.button_frame, text="Edit (E)", command=self.on_edit)
+        self.save_button.pack(fill=tk.X, pady=3)
+        self.edit_button.pack(fill=tk.X, pady=3)
+        self.set_status("Processing complete — save or edit annotations")
 
     def on_save(self):
         try:
@@ -629,9 +684,12 @@ class CloudImageApp:
                 cv2.imwrite(final_path, image)
                 self.update_coordinates_file()
                 self.image_processed = True
-                messagebox.showinfo("Success", "Image saved locally. Click 'Next Image' to upload to cloud.")
+                self.last_save_time = datetime.now()
                 self.setup_initial_ui()
                 self.display_image(processed_path)
+                self.set_status(
+                    f"Saved locally at {self.last_save_time.strftime('%H:%M:%S')} — use Next to upload to Drive"
+                )
             else:
                 messagebox.showerror("Error", "No processed image found. Please process the image first.")
         except Exception as e:
@@ -668,6 +726,7 @@ class CloudImageApp:
                     messagebox.showerror("Upload Error", "Image upload failed; rolled back coordinate upload.")
                     return
             self.image_processed = False
+            self.set_status(f"Uploaded {self.current_image_info.get('name', 'tile')} to Drive")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to upload to cloud: {str(e)}")
 
@@ -752,7 +811,7 @@ class CloudImageApp:
                         'mimeType': 'application/vnd.google-apps.folder',
                         'parents': [mouse_folder_id]
                     }
-                    self.drive_service.files().create(body=images_metadata, files='id').execute()
+                    self.drive_service.files().create(body=images_metadata, fields='id').execute()
             return mouse_folder_id
         except Exception as e:
             messagebox.showerror("Error", f"Failed to create mouse folder: {str(e)}")
@@ -771,27 +830,83 @@ class CloudImageApp:
         processed_path = os.path.join(self.processed_dir, self.current_image_info['name'])
         image_path = processed_path if os.path.exists(processed_path) else os.path.join(self.temp_dir, self.current_image_info['name'])
         if os.path.exists(image_path):
-            self.current_image = cv2.imread(image_path)
-            image_pil = Image.open(image_path).resize((1280, 512))
-            self.image_tk_edit = ImageTk.PhotoImage(image_pil)
-            self.canvas_image = self.edit_canvas.create_image(0, 0, anchor=tk.NW, image=self.image_tk_edit)
+            if not os.path.exists(processed_path):
+                shutil.copy2(image_path, processed_path)
+            self.current_image = cv2.imread(processed_path)
             coord_file = os.path.join(self.coords_dir, f"{os.path.splitext(self.current_image_info['name'])[0]}_coords.txt")
             if os.path.exists(coord_file):
                 self.rectangles = self.load_coordinates(self.current_image_info['name'])
             self.edit_canvas.bind("<ButtonPress-1>", self.on_drag_start)
             self.edit_canvas.bind("<B1-Motion>", self.on_drag_move)
             self.edit_canvas.bind("<ButtonRelease-1>", self.on_drag_end)
+            self.edit_canvas.bind("<Delete>", lambda e: self._delete_last_rectangle())
+            self._refresh_edit_canvas_view()
+            self.update_mode()
+            self.set_status("Edit mode — draw or remove annotation boxes")
         else:
             messagebox.showerror("Error", "Image not found")
             self.setup_initial_ui()
+
+    def _on_edit_wheel(self, event):
+        delta = 1 if event.delta > 0 else -1
+        self._on_edit_wheel_delta(delta)
+
+    def _on_edit_wheel_delta(self, direction):
+        if direction > 0:
+            self.edit_zoom = min(self.edit_zoom * 1.1, 3.0)
+        else:
+            self.edit_zoom = max(self.edit_zoom / 1.1, 0.5)
+        self._refresh_edit_canvas_view()
+
+    def _on_pan_start(self, event):
+        self._pan_start = (event.x, event.y, self.edit_pan_x, self.edit_pan_y)
+
+    def _on_pan_move(self, event):
+        if self._pan_start:
+            dx = event.x - self._pan_start[0]
+            dy = event.y - self._pan_start[1]
+            self.edit_pan_x = self._pan_start[2] + dx
+            self.edit_pan_y = self._pan_start[3] + dy
+            self._refresh_edit_canvas_view()
+
+    def _on_pan_end(self, _event):
+        self._pan_start = None
+
+    def _refresh_edit_canvas_view(self):
+        if not hasattr(self, "edit_canvas") or not self.edit_canvas.winfo_exists():
+            return
+        base_path = os.path.join(self.processed_dir, self.current_image_info["name"])
+        if not os.path.exists(base_path):
+            return
+        image = cv2.imread(base_path)
+        for rect in self.rectangles:
+            x1, y1, x2, y2, class_name = rect
+            color = self.feature_colors.get(class_name, (0, 255, 0))
+            cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(image, class_name, (x1, max(y1 - 8, 12)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1, cv2.LINE_AA)
+        disp = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        pil = Image.fromarray(disp).resize((1280, 512), Image.LANCZOS)
+        zw, zh = int(1280 * self.edit_zoom), int(512 * self.edit_zoom)
+        pil = pil.resize((zw, zh), Image.LANCZOS)
+        self.image_tk_edit = ImageTk.PhotoImage(pil)
+        self.edit_canvas.delete("all")
+        self.canvas_image = self.edit_canvas.create_image(
+            self.edit_pan_x, self.edit_pan_y, anchor=tk.NW, image=self.image_tk_edit
+        )
+        self.update_chrome()
+
+    def _delete_last_rectangle(self):
+        if self.rectangles:
+            self.rectangles.pop()
+            self.update_coordinates_file()
+            self._refresh_edit_canvas_view()
 
     def on_drag_start(self, event):
         if self.mode.get() == "Add":
             self.start_x, self.start_y = event.x, event.y
             self.rect_id = None
         elif self.mode.get() == "Remove":
-            x, y = event.x, event.y
-            self.remove_rectangle(x, y)
+            self.remove_rectangle(event.x, event.y)
 
     def on_drag_move(self, event):
         if self.mode.get() == "Add":
@@ -804,22 +919,16 @@ class CloudImageApp:
 
     def on_drag_end(self, event):
         if self.mode.get() == "Add":
-            canvas_width = 1280
-            canvas_height = 512
-            image = cv2.imread(os.path.join(self.processed_dir, self.current_image_info['name']))
-            original_height, original_width = image.shape[:2]
-            scale_x = original_width / canvas_width
-            scale_y = original_height / canvas_height
-            scaled_start_x = int(self.start_x * scale_x)
-            scaled_start_y = int(self.start_y * scale_y)
-            scaled_end_x = int(event.x * scale_x)
-            scaled_end_y = int(event.y * scale_y)
+            scaled_start_x, scaled_start_y = self._event_to_image_coords(self.start_x, self.start_y)
+            scaled_end_x, scaled_end_y = self._event_to_image_coords(event.x, event.y)
             for rect in self.rectangles:
                 x1, y1, x2, y2, _ = rect
                 if x1 == scaled_start_x and y1 == scaled_start_y and x2 == scaled_end_x and y2 == scaled_end_y:
                     return
             self.save_rectangle(scaled_start_x, scaled_start_y, scaled_end_x, scaled_end_y)
-            self.redraw_image()
+            if self.rect_id:
+                self.edit_canvas.delete(self.rect_id)
+                self.rect_id = None
 
     def save_rectangle(self, x1, y1, x2, y2):
         class_name = self.feature_type.get()
@@ -827,77 +936,42 @@ class CloudImageApp:
         if new_rect not in self.rectangles:
             self.rectangles.append(new_rect)
         self.update_coordinates_file()
-        self.redraw_image()
+        self._refresh_edit_canvas_view()
 
     def remove_rectangle(self, x, y):
-        canvas_width = 1280
-        canvas_height = 512
-        image = cv2.imread(os.path.join(self.processed_dir, self.current_image_info['name']))
-        original_height, original_width = image.shape[:2]
-        scale_x = original_width / canvas_width
-        scale_y = original_height / canvas_height
-        scaled_x = int(x * scale_x)
-        scaled_y = int(y * scale_y)
+        scaled_x, scaled_y = self._event_to_image_coords(x, y)
         for rect in self.rectangles[:]:
             x1, y1, x2, y2, _ = rect
             if x1 <= scaled_x <= x2 and y1 <= scaled_y <= y2:
                 self.rectangles.remove(rect)
                 self.update_coordinates_file()
-                self.redraw_image()
-                line_thickness = 2
-                line_length = 10
-                color = (0, 0, 255)
-                cv2.line(image, (scaled_x - line_length, scaled_y - line_length),
-                         (scaled_x + line_length, scaled_y + line_length), color, thickness=line_thickness)
-                cv2.line(image, (scaled_x - line_length, scaled_y + line_length),
-                         (scaled_x + line_length, scaled_y - line_length), color, thickness=line_thickness)
-                updated_image_path = os.path.join(self.processed_dir, self.current_image_info['name'])
-                cv2.imwrite(updated_image_path, image)
-                updated_image = Image.open(updated_image_path).resize((1280, 512))
-                self.image_tk_edit = ImageTk.PhotoImage(updated_image)
-                self.edit_canvas.itemconfig(self.canvas_image, image=self.image_tk_edit)
+                self._refresh_edit_canvas_view()
                 return
 
     def redraw_image(self):
-        base_image_path = os.path.join(self.processed_dir, self.current_image_info['name'])
+        base_image_path = os.path.join(self.processed_dir, self.current_image_info["name"])
         image = cv2.imread(base_image_path)
         for rect in self.rectangles:
             x1, y1, x2, y2, class_name = rect
             color = self.feature_colors.get(class_name, (0, 255, 0))
             cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
-            label = f"{class_name}"
-            cv2.putText(image, label, (x1, y1 - 20), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
-        updated_image_path = os.path.join(self.processed_dir, self.current_image_info['name'])
-        cv2.imwrite(updated_image_path, image)
-        updated_image = Image.open(updated_image_path).resize((1280, 512))
-        self.image_tk_edit = ImageTk.PhotoImage(updated_image)
-        self.edit_canvas.itemconfig(self.canvas_image, image=self.image_tk_edit)
+            cv2.putText(image, class_name, (x1, max(y1 - 8, 12)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1, cv2.LINE_AA)
+        cv2.imwrite(base_image_path, image)
+        self._refresh_edit_canvas_view()
 
     def update_mode(self):
+        if not hasattr(self, "edit_canvas"):
+            return
         if self.mode.get() == "Add":
-            self.edit_canvas.config(cursor="arrow")
-        elif self.mode.get() == "Remove":
             self.edit_canvas.config(cursor="crosshair")
+        elif self.mode.get() == "Remove":
+            self.edit_canvas.config(cursor="X_cursor")
 
     def clear_edit_widgets(self):
-        widgets_to_remove = [
-            'mode_label_name', 'mode_label', 'add_radio', 
-            'remove_radio', 'edit_canvas', 'finalize_button'
-        ]
-        for widget_name in widgets_to_remove:
-            if hasattr(self, widget_name):
-                widget = getattr(self, widget_name)
-                try:
-                    widget.pack_forget()
-                    widget.destroy()
-                except tk.TclError:
-                    pass
-                except Exception as e:
-                    logging.error(f"Failed to clear widget {widget_name}: {str(e)}")
-                finally:
-                    if hasattr(self, widget_name):
-                        delattr(self, widget_name)
+        self.edit_mode = False
+        self.edit_zoom = 1.0
+        self.edit_pan_x = 0
+        self.edit_pan_y = 0
 
     def cleanup(self):
         try:
@@ -913,37 +987,56 @@ class CloudImageApp:
 
     def generate_variability_plots(self):
         logger = logging.getLogger(__name__)
+        temp_dir = None
         try:
             temp_dir = tempfile.mkdtemp()
+            self.show_loading("Fetching observer list from Drive…")
+            self.root.update_idletasks()
             observers = self.get_observers_from_drive()
             if len(observers) < 2:
+                self.set_status(f"Need 2+ observers; found {len(observers)}")
                 messagebox.showinfo(
-                    "Info", 
-                    f"Need at least 2 observers for comparison. Found {len(observers)} observer(s)."
+                    "Info",
+                    f"Need at least 2 observers for comparison. Found {len(observers)} observer(s).",
                 )
                 return
+            self.loading_label.config(text="Building comparison cache (may take a minute)…")
+            self.root.update_idletasks()
             common_images = self.find_common_images(observers)
             if len(common_images) < self.interobplt_thresh:
+                self.set_status(f"Need {self.interobplt_thresh}+ common tiles; found {len(common_images)}")
                 messagebox.showinfo(
-                    "Info", 
-                    f"Need at least {self.interobplt_thresh} common images for comparison. Found {len(common_images)} common images."
+                    "Info",
+                    f"Need at least {self.interobplt_thresh} common images. Found {len(common_images)}.",
                 )
                 return
+            self.loading_label.config(text="Downloading coordinate files…")
+            self.root.update_idletasks()
             self.download_all_coords(observers, common_images, temp_dir)
-            image_files = self.generate_visualizations(temp_dir, observers, common_images)
+            self.loading_label.config(text="Generating plots…")
+            self.root.update_idletasks()
+            image_files, html_files = self.generate_visualizations(temp_dir, observers, common_images)
             if not image_files:
-                messagebox.showwarning("Warning", "No variability plots generated. Check if coordinate files contain valid annotations.")
+                messagebox.showwarning(
+                    "Warning",
+                    "No variability plots generated. Check if coordinate files contain valid annotations.",
+                )
                 return
             self.display_plots_window(image_files)
-            messagebox.showinfo(
-                "Success", 
-                f"Generated variability plots for {len(observers)} observers and {len(common_images)} common images."
+            for html_path in html_files:
+                try:
+                    webbrowser.open(f"file://{html_path}")
+                except Exception:
+                    pass
+            self.set_status(
+                f"Plots ready — {len(observers)} observers, {len(common_images)} common tiles"
             )
         except Exception as e:
             logger.error(f"Failed to generate plots: {str(e)}")
             messagebox.showerror("Error", f"Failed to generate plots: {str(e)}")
         finally:
-            if os.path.exists(temp_dir):
+            self.hide_loading()
+            if temp_dir and os.path.exists(temp_dir):
                 try:
                     shutil.rmtree(temp_dir, ignore_errors=True)
                 except Exception as e:
@@ -1107,12 +1200,11 @@ class CloudImageApp:
                 "Hyaline Membranes": 1,
                 "Proteinaceous Debris": 2
             }
-            color_mapping = {
-                observers[0]: "#2D6A4F",
-                "Common": "#F4D35E",
-                observers[1]: "#84C5A1"
-            }
+            color_mapping = {"Common": "#E9C46A"}
+            for i, observer in enumerate(observers):
+                color_mapping[observer] = PLOT_COLORS[i % len(PLOT_COLORS)]
             image_files = []
+            html_files = []
             for feature in class_mapping.keys():
                 plot_data = []
                 for mouse, image_name in common_images:
@@ -1184,14 +1276,15 @@ class CloudImageApp:
                 if df.empty or df['Common'].sum() == 0:
                     logger.warning(f"No valid annotations for {feature}")
                     continue
-                image_path = self.create_variability_plot(
+                image_path, html_path = self.create_variability_plot(
                     df, "All Mice", feature, observers, color_mapping, viz_dir
                 )
                 image_files.append((feature, image_path))
+                html_files.append(html_path)
                 del df
                 import gc
                 gc.collect()
-            return image_files
+            return image_files, html_files
         except Exception as e:
             logger.error(f"Failed to generate visualizations: {str(e)}")
             raise
@@ -1234,29 +1327,33 @@ class CloudImageApp:
                     text=df[observer].round(1).astype(str) + '%',
                     textposition='inside'
                 ))
-            title = f"<b>Inter-Observer Variability of {feature} Counts Across All Mice</b>"
+            title = f"Inter-Observer Variability — {feature}"
+            tick_angle = -45 if len(df) > 12 else 0
             fig.update_layout(
-                barmode='stack',
-                title=title,
-                xaxis_title="<b>Tile Index</b>",
-                yaxis_title="<b>Percentage</b>",
-                xaxis=dict(
-                    tickmode='linear',
-                    tick0=1,
-                    dtick=2
-                ),
-                legend_title="<b>Observers</b>",
+                template="plotly_white",
+                barmode="stack",
+                title=dict(text=title, font=dict(size=16, color="#1B4965")),
+                font=dict(family="DejaVu Sans, Arial, sans-serif", size=12, color="#1D3557"),
+                xaxis_title="Tile index",
+                yaxis_title="Percentage",
+                xaxis=dict(tickmode="linear", tick0=0, dtick=1, tickangle=tick_angle),
+                legend_title="Observers",
                 yaxis=dict(range=[0, 100]),
                 width=1200,
-                height=600
+                height=600,
+                margin=dict(t=80, b=80),
+                plot_bgcolor="#F8FAFC",
+                paper_bgcolor="#FFFFFF",
             )
-            viz_filename = f"inter_observer_{feature.replace(' ', '_')}.png"
-            viz_path = os.path.join(viz_dir, viz_filename)
-            fig.write_image(viz_path, format="png")
+            base = f"inter_observer_{feature.replace(' ', '_')}"
+            viz_path = os.path.join(viz_dir, f"{base}.png")
+            html_path = os.path.join(viz_dir, f"{base}.html")
+            fig.write_image(viz_path, format="png", scale=2)
+            pio.write_html(fig, file=html_path, auto_open=False, include_plotlyjs="cdn")
             del fig
             import gc
             gc.collect()
-            return viz_path
+            return viz_path, html_path
         except Exception as e:
             logger.error(f"Failed to create variability plot: {str(e)}")
             raise
@@ -1265,18 +1362,48 @@ class CloudImageApp:
         try:
             plot_window = tk.Toplevel(self.root)
             plot_window.title("Inter-Observer Variability Plots")
-            plot_window.geometry("1280x800")
+            plot_window.geometry("1280x820")
+            plot_window.configure(bg=BRAND["bg"])
+            self._center_window(plot_window, 1280, 820)
+            top = ttk.Frame(plot_window)
+            top.pack(fill=tk.X, padx=12, pady=8)
+            ttk.Label(top, text="Feature:", font=self.ui_font_bold).pack(side=tk.LEFT)
+            feature_names = [f[0] for f in image_files]
+            plot_paths = {f[0]: f[1] for f in image_files}
+            selector = ttk.Combobox(top, values=feature_names, state="readonly", width=32)
+            selector.pack(side=tk.LEFT, padx=8)
+            if feature_names:
+                selector.set(feature_names[0])
+            canvas_holder = ttk.Frame(plot_window)
+            canvas_holder.pack(fill=tk.BOTH, expand=True, padx=12, pady=4)
+            image_label = ttk.Label(canvas_holder)
+            image_label.pack()
+            photos = {}
+
+            def show_feature(*_):
+                name = selector.get()
+                path = plot_paths.get(name)
+                if not path:
+                    return
+                image = Image.open(path)
+                image.thumbnail((1200, 640), Image.LANCZOS)
+                photo = ImageTk.PhotoImage(image)
+                photos["current"] = photo
+                image_label.config(image=photo)
+
+            selector.bind("<<ComboboxSelected>>", show_feature)
+            show_feature()
             notebook = ttk.Notebook(plot_window)
-            notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+            notebook.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
             for feature, image_path in image_files:
                 tab_frame = ttk.Frame(notebook)
-                notebook.add(tab_frame, text=feature)
-                image = Image.open(image_path)
-                image = image.resize((1200, 600), Image.LANCZOS)
-                photo = ImageTk.PhotoImage(image)
-                image_label = ttk.Label(tab_frame, image=photo)
-                image_label.image = photo
-                image_label.pack(padx=10, pady=10)
+                notebook.add(tab_frame, text=feature[:12])
+                thumb = Image.open(image_path)
+                thumb.thumbnail((360, 200), Image.LANCZOS)
+                photo = ImageTk.PhotoImage(thumb)
+                photos[feature] = photo
+                ttk.Label(tab_frame, image=photo).pack(padx=8, pady=8)
+                ttk.Label(tab_frame, text=feature, font=self.ui_font).pack()
             plot_window.protocol("WM_DELETE_WINDOW", plot_window.destroy)
         except Exception as e:
             messagebox.showerror("Error", f"Failed to display plots: {str(e)}")

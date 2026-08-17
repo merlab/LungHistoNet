@@ -1,0 +1,7 @@
+# Merged Observer1+Observer2 dataset (union + WBF). val = held-out slides Aswcm3, Sahar27.
+path: /home/amir_ebrahimi/Documents/LungHistoNet/Yolo/Data/Yolo_Merged/dataset
+train: images/train
+val: images/test
+
+names:
+  0: neutrophil

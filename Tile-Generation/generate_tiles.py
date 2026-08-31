@@ -9,6 +9,7 @@ Grid output layout (default):
 """
 
 import argparse
+import json
 import os
 import random
 from concurrent.futures import ThreadPoolExecutor
@@ -214,6 +215,41 @@ def tile_passes_quality(rgb: np.ndarray, cfg: QualityConfig) -> bool:
     return ok
 
 
+def resolve_level_for_mpp(path, target_mpp, assume_mpp=0.25):
+    """Pick the pyramid level to read so that `target_mpp` needs only downscaling.
+
+    TCGA slides are NOT all the same resolution (in TCGA-BRCA: 0.25, 0.23, 0.5 and
+    0.16 um/px all occur). Tiling a fixed pixel size at level 0 therefore yields
+    tiles whose *physical* field of view varies per slide, which is a scale
+    artifact MIL attention can key on. Selecting the level by microns-per-pixel and
+    resampling to a fixed target keeps every tile the same physical size.
+
+    Returns (level, level_mpp, native_mpp, assumed) where `assumed` is True when the
+    slide carries no MPP metadata and `assume_mpp` was substituted.
+    """
+    img = pyvips.Image.new_from_file(path)
+    fields = set(img.get_fields())
+
+    def g(k):
+        return img.get(k) if k in fields else None
+
+    native = g("openslide.mpp-x") or g("aperio.MPP")
+    assumed = native is None
+    native = float(assume_mpp) if assumed else float(native)
+
+    n_levels = int(g("openslide.level-count") or 1)
+    level, level_mpp = 0, native
+    for L in range(n_levels):
+        d = g(f"openslide.level[{L}].downsample")
+        if d is None:
+            continue
+        m = native * float(d)
+        # largest (coarsest) level that is still finer than the target
+        if m <= target_mpp + 1e-9 and m > level_mpp:
+            level, level_mpp = L, m
+    return level, level_mpp, native, assumed
+
+
 def build_slide_tissue_mask(slide: pyvips.Image, cfg: QualityConfig, file_path: str | None = None):
     """
     Build a low-res binary tissue mask for the whole slide.
@@ -386,6 +422,10 @@ def process_tile(
     save_ext: str = "jpg",
     save_rejected: bool = False,
     reject_reason: str | None = None,
+    out_w: int | None = None,
+    out_h: int | None = None,
+    name_x: int | None = None,
+    name_y: int | None = None,
 ):
     """
     Crop and optionally save a tile.
@@ -400,13 +440,29 @@ def process_tile(
     if actual_patch_w <= 0 or actual_patch_h <= 0:
         return {"status": "skipped", "reason": "oob", "path": None}
 
+    resampling = out_w is not None and out_h is not None
+    if resampling and (actual_patch_w != patch_size_w or actual_patch_h != patch_size_h):
+        # A partial edge crop stretched to the full output size would silently carry a
+        # different microns-per-pixel than every other tile. Drop it instead.
+        return {"status": "skipped", "reason": "oob", "path": None}
+
     tile = slide.crop(x, y, actual_patch_w, actual_patch_h)
+
+    if resampling and (actual_patch_w != out_w or actual_patch_h != out_h):
+        # Resample BEFORE the quality checks so the filters judge exactly the pixels
+        # the downstream encoder will receive.
+        tile = tile.resize(out_w / actual_patch_w,
+                           vscale=out_h / actual_patch_h,
+                           kernel="lanczos3")
+
+    tx = x if name_x is None else name_x
+    ty = y if name_y is None else name_y
 
     if reject_reason is not None:
         if not save_rejected:
             return {"status": "discarded", "reason": reject_reason, "path": None}
         out_ext = "jpg"
-        path = os.path.join(fdir, "discarded", reject_reason, f"tile_{x}_{y}.{out_ext}")
+        path = os.path.join(fdir, "discarded", reject_reason, f"tile_{tx}_{ty}.{out_ext}")
         _write_tile(tile, path, out_ext)
         return {"status": "discarded", "reason": reject_reason, "path": path}
 
@@ -415,15 +471,15 @@ def process_tile(
 
     if ok:
         if save_rejected:
-            path = os.path.join(fdir, "kept", f"tile_{x}_{y}.{save_ext}")
+            path = os.path.join(fdir, "kept", f"tile_{tx}_{ty}.{save_ext}")
         else:
-            path = os.path.join(fdir, f"tile_{x}_{y}.{save_ext}")
+            path = os.path.join(fdir, f"tile_{tx}_{ty}.{save_ext}")
         _write_tile(tile, path, save_ext)
         return {"status": "kept", "reason": "kept", "path": path}
 
     if save_rejected:
         out_ext = "jpg"
-        path = os.path.join(fdir, "discarded", reason, f"tile_{x}_{y}.{out_ext}")
+        path = os.path.join(fdir, "discarded", reason, f"tile_{tx}_{ty}.{out_ext}")
         _write_tile(tile, path, out_ext)
         return {"status": "discarded", "reason": reason, "path": path}
 
@@ -442,6 +498,10 @@ def process_tile_2(
     cfg: QualityConfig,
     save_rejected: bool = False,
     reject_reason: str | None = None,
+    out_w: int | None = None,
+    out_h: int | None = None,
+    name_x: int | None = None,
+    name_y: int | None = None,
 ):
     return process_tile(
         slide=slide,
@@ -456,6 +516,10 @@ def process_tile_2(
         save_ext="png" if not save_rejected else "png",
         save_rejected=save_rejected,
         reject_reason=reject_reason,
+        out_w=out_w,
+        out_h=out_h,
+        name_x=name_x,
+        name_y=name_y,
     )
 
 
@@ -631,8 +695,23 @@ def generate_tiles(
     scale_y=1.0,
     save_rejected: bool = False,
     save_rejected_mask: bool = False,
+    out_w: int | None = None,
+    out_h: int | None = None,
+    max_tiles: int | None = None,
+    seed: int = 0,
 ):
-    """Slide a tile window across the slide; keep tissue-quality tiles only."""
+    """Slide a tile window across the slide; keep tissue-quality tiles only.
+
+    `patch_size_w/h` are the crop size in the coordinate frame of `slide` (the chosen
+    pyramid level). When `out_w/out_h` differ, each crop is resampled to that output
+    size, which is how a fixed physical tile size is held constant across slides of
+    differing native resolution. Tile filenames use output-frame coordinates so the
+    usual `tile_{x}_{y}` stride equals the output tile size.
+
+    `max_tiles` caps kept tiles per slide. Candidates are shuffled with `seed` first,
+    so the cap yields a spatially uniform sample over tissue rather than the top-left
+    corner of the slide. The cap can overshoot by less than one chunk (64).
+    """
     overlap = float(np.clip(overlap, 0.0, 0.9))
     step_w = max(1, int(patch_size_w * (1.0 - overlap)))
     step_h = max(1, int(patch_size_h * (1.0 - overlap)))
@@ -644,49 +723,70 @@ def generate_tiles(
     counts = {}
     mask_skipped = 0
 
+    resampling = out_w is not None and out_h is not None
+    o_w = out_w if resampling else patch_size_w
+    o_h = out_h if resampling else patch_size_h
+
+    # Enumerate candidate positions first so the per-slide cap can sample over the
+    # whole tissue area instead of stopping partway through raster order.
+    candidates = []
+    for y in range(0, max(1, height - patch_size_h + 1), step_h):
+        for x in range(0, max(1, width - patch_size_w + 1), step_w):
+            mask_ok = True
+            if tissue_mask is not None and not mask_covers_tile(
+                tissue_mask,
+                scale_x,
+                scale_y,
+                x,
+                y,
+                patch_size_w,
+                patch_size_h,
+                cfg.mask_min_tile_frac,
+            ):
+                mask_ok = False
+                mask_skipped += 1
+                if not (save_rejected and save_rejected_mask):
+                    continue
+            candidates.append((x, y, mask_ok))
+
+    if max_tiles is not None:
+        random.Random(seed).shuffle(candidates)
+
+    kept = 0
+    chunk = 64
     with ThreadPoolExecutor() as executor:
-        futures = []
-        for y in range(0, height, step_h):
-            for x in range(0, width, step_w):
-                mask_ok = True
-                if tissue_mask is not None and not mask_covers_tile(
-                    tissue_mask,
-                    scale_x,
-                    scale_y,
+        for i in range(0, len(candidates), chunk):
+            if max_tiles is not None and kept >= max_tiles:
+                break
+            futures = [
+                executor.submit(
+                    process_tile_2,
                     x,
                     y,
+                    width,
+                    height,
                     patch_size_w,
                     patch_size_h,
-                    cfg.mask_min_tile_frac,
-                ):
-                    mask_ok = False
-                    mask_skipped += 1
-                    if not (save_rejected and save_rejected_mask):
-                        continue
-
-                futures.append(
-                    executor.submit(
-                        process_tile_2,
-                        x,
-                        y,
-                        width,
-                        height,
-                        patch_size_w,
-                        patch_size_h,
-                        output_dir,
-                        slide,
-                        cfg,
-                        save_rejected,
-                        None if mask_ok else "mask_skip",
-                    )
+                    output_dir,
+                    slide,
+                    cfg,
+                    save_rejected,
+                    None if mask_ok else "mask_skip",
+                    o_w,
+                    o_h,
+                    int(round(x * o_w / patch_size_w)),
+                    int(round(y * o_h / patch_size_h)),
                 )
+                for x, y, mask_ok in candidates[i:i + chunk]
+            ]
+            for future in futures:
+                result = future.result()
+                reason = result.get("reason", "unknown")
+                counts[reason] = counts.get(reason, 0) + 1
+                if result.get("status") == "kept":
+                    kept += 1
 
-        for future in futures:
-            result = future.result()
-            reason = result.get("reason", "unknown")
-            counts[reason] = counts.get(reason, 0) + 1
-
-    kept = counts.get("kept", 0)
+    counts["kept"] = kept
     if save_rejected:
         summary_path = os.path.join(output_dir, "reject_summary.txt")
         with open(summary_path, "w", encoding="utf-8") as f:
@@ -736,6 +836,21 @@ def list_slide_files(slide_dir, prefer_ext: str | None = "svs"):
     return sorted(selected)
 
 
+def list_slide_files_recursive(slide_dir, prefer_ext: str | None = "svs"):
+    """Walk `slide_dir` and return slide paths relative to it (one per stem).
+
+    TCGA trees are nested as <project>/<patient>/<slide>.svs, so a flat listdir
+    finds nothing. Relative paths are returned so the caller can keep the patient
+    directory in the output name.
+    """
+    out = []
+    for root, _dirs, files in os.walk(slide_dir):
+        keep = list_slide_files(root, prefer_ext=prefer_ext) if files else []
+        for f in keep:
+            out.append(os.path.relpath(os.path.join(root, f), slide_dir))
+    return sorted(out)
+
+
 def resolve_grid_output_base(
     slide_dir: str,
     output_base: str | None,
@@ -774,12 +889,18 @@ def run_grid(
     prefer_ext: str | None = "svs",
     save_rejected: bool = True,
     save_rejected_mask: bool = False,
+    target_mpp: float | None = None,
+    assume_mpp: float = 0.25,
+    max_tiles: int | None = None,
+    seed: int = 0,
+    recursive: bool = False,
 ):
     """Batch sliding-window generation over a folder of whole-slide images."""
     slide_dir = os.path.expanduser(slide_dir)
     group_output = resolve_grid_output_base(slide_dir, output_base, patch_w, patch_h)
     os.makedirs(group_output, exist_ok=True)
-    files = list_slide_files(slide_dir, prefer_ext=prefer_ext)
+    files = (list_slide_files_recursive(slide_dir, prefer_ext=prefer_ext)
+             if recursive else list_slide_files(slide_dir, prefer_ext=prefer_ext))
 
     if not files:
         raise FileNotFoundError(
@@ -789,37 +910,97 @@ def run_grid(
     print(f"Output root: {group_output}")
     print(f"Layout: {{slide_stem}}/kept/  and  {{slide_stem}}/discarded/{{reason}}/")
 
+    failures = []
     for file in tqdm(files, desc="Generating tiles"):
         full_path = os.path.join(slide_dir, file)
-        output_dir = slide_output_dir(group_output, file)
-        os.makedirs(output_dir, exist_ok=True)
-        slide = pyvips.Image.new_from_file(full_path)
+        # Keep the patient directory in the output name when walking a nested tree.
+        name = file.replace(os.sep, "_") if recursive else file
+        output_dir = slide_output_dir(group_output, name)
 
-        tissue_mask = scale_x = scale_y = None
-        if cfg.use_tissue_mask:
-            tissue_mask, scale_x, scale_y = build_slide_tissue_mask(
-                slide, cfg, file_path=full_path
+        if os.path.isdir(output_dir) and os.path.exists(
+            os.path.join(output_dir, "tiling_manifest.json")
+        ):
+            print(f"{file}: already tiled, skipping")
+            continue
+
+        try:
+            level, level_mpp, native_mpp, assumed = 0, None, None, False
+            src_w, src_h = patch_w, patch_h
+            out_w = out_h = None
+
+            if target_mpp is not None:
+                level, level_mpp, native_mpp, assumed = resolve_level_for_mpp(
+                    full_path, target_mpp, assume_mpp=assume_mpp
+                )
+                ratio = target_mpp / level_mpp
+                src_w = int(round(patch_w * ratio))
+                src_h = int(round(patch_h * ratio))
+                out_w, out_h = patch_w, patch_h
+                if assumed:
+                    print(f"  [warn] {file}: no MPP metadata; assuming {assume_mpp}")
+
+            slide = (pyvips.Image.new_from_file(full_path, level=level)
+                     if level else pyvips.Image.new_from_file(full_path))
+
+            os.makedirs(output_dir, exist_ok=True)
+
+            tissue_mask = scale_x = scale_y = None
+            if cfg.use_tissue_mask:
+                tissue_mask, scale_x, scale_y = build_slide_tissue_mask(
+                    slide, cfg, file_path=full_path
+                )
+                if not np.any(tissue_mask):
+                    print(f"Warning: empty tissue mask for {file}; processing full grid.")
+                    tissue_mask = None
+
+            saved = generate_tiles(
+                width=slide.width,
+                height=slide.height,
+                patch_size_w=src_w,
+                patch_size_h=src_h,
+                output_dir=output_dir,
+                slide=slide,
+                cfg=cfg,
+                overlap=overlap,
+                tissue_mask=tissue_mask,
+                scale_x=scale_x or 1.0,
+                scale_y=scale_y or 1.0,
+                save_rejected=save_rejected,
+                save_rejected_mask=save_rejected_mask,
+                out_w=out_w,
+                out_h=out_h,
+                max_tiles=max_tiles,
+                seed=seed,
             )
-            if not np.any(tissue_mask):
-                print(f"Warning: empty tissue mask for {file}; processing full grid.")
-                tissue_mask = None
 
-        saved = generate_tiles(
-            width=slide.width,
-            height=slide.height,
-            patch_size_w=patch_w,
-            patch_size_h=patch_h,
-            output_dir=output_dir,
-            slide=slide,
-            cfg=cfg,
-            overlap=overlap,
-            tissue_mask=tissue_mask,
-            scale_x=scale_x or 1.0,
-            scale_y=scale_y or 1.0,
-            save_rejected=save_rejected,
-            save_rejected_mask=save_rejected_mask,
-        )
-        print(f"{file}: kept {saved} tiles -> {output_dir}")
+            # Provenance: without this the physical scale of a tile set is
+            # unrecoverable after the fact.
+            with open(os.path.join(output_dir, "tiling_manifest.json"), "w") as fh:
+                json.dump({
+                    "slide": file,
+                    "native_mpp": native_mpp,
+                    "native_mpp_assumed": assumed,
+                    "target_mpp": target_mpp,
+                    "level_read": level,
+                    "level_mpp": level_mpp,
+                    "src_patch": [src_w, src_h],
+                    "out_patch": [patch_w, patch_h],
+                    "microns_per_tile": (patch_w * target_mpp) if target_mpp else None,
+                    "overlap": overlap,
+                    "max_tiles": max_tiles,
+                    "seed": seed,
+                    "kept": saved,
+                }, fh, indent=2)
+
+            print(f"{file}: kept {saved} tiles -> {output_dir}")
+        except Exception as exc:
+            failures.append((file, str(exc).split(chr(10))[0][:120]))
+            print(f"  [FAIL] {file}: {exc}")
+
+    if failures:
+        print(f"\n{len(failures)} slide(s) failed:")
+        for f, e in failures:
+            print(f"  {f}: {e}")
 
 
 def stitch_tiles_to_single_image(output_dir, width, height, patch_size_w, patch_size_h):
@@ -1049,6 +1230,36 @@ def build_parser():
     )
 
     # Random
+    parser.add_argument(
+        "--target-mpp",
+        type=float,
+        default=None,
+        help="Resample every tile to this microns-per-pixel (e.g. 0.5 for 20x). "
+             "Reads the nearest finer pyramid level and downscales, so tiles have a "
+             "fixed PHYSICAL size even when slides differ in native resolution. "
+             "Without it, tiles are cropped at level 0 in raw pixels.",
+    )
+    parser.add_argument(
+        "--assume-mpp",
+        type=float,
+        default=0.25,
+        help="MPP to assume for slides with no resolution metadata (default: 0.25)",
+    )
+    parser.add_argument(
+        "--max-tiles-per-slide",
+        type=int,
+        default=None,
+        help="Cap kept tiles per slide. Candidates are shuffled first, so the cap is "
+             "a spatially uniform sample over tissue (default: no cap)",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=0, help="Seed for the per-slide tile sampling"
+    )
+    parser.add_argument(
+        "--recursive",
+        action="store_true",
+        help="Walk sub-directories of --slide-dir (e.g. <project>/<patient>/<slide>.svs)",
+    )
     parser.add_argument("--image", type=str, default=None, help="Single slide path (random mode)")
     parser.add_argument(
         "--patch-type",
@@ -1115,6 +1326,11 @@ def main(argv=None):
             prefer_ext=prefer,
             save_rejected=not args.no_save_rejected,
             save_rejected_mask=args.save_rejected_mask,
+            target_mpp=args.target_mpp,
+            assume_mpp=args.assume_mpp,
+            max_tiles=args.max_tiles_per_slide,
+            seed=args.seed,
+            recursive=args.recursive,
         )
     elif args.mode == "random":
         if not args.image:

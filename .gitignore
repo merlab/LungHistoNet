@@ -27,3 +27,6 @@ Application/*.json
 Application/test_upload_download.ipynb
 
 Test/
+
+Tile-Generation/generate_tiles.py.bak
+Tile-Generation/README.md.bak

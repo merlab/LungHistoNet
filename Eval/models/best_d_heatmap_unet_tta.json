@@ -1,0 +1,28 @@
+{
+  "source_weights": "runs/heatmap_unet/best.pt",
+  "selected_by": "f1",
+  "test_slides": [
+    "Aswcm3",
+    "Sahar27"
+  ],
+  "inference": {
+    "imgsz": null,
+    "tta": true,
+    "threshold_for_best_f1": 0.85,
+    "threshold_for_best_count": 0.9,
+    "note": "use threshold_for_best_count when the output is a cell count; for the heatmap model the threshold is a peak height, not a detector confidence"
+  },
+  "metrics": {
+    "model": "D heatmap UNet +TTA",
+    "f1": 0.6135,
+    "precision": 0.5852,
+    "recall": 0.6446,
+    "f1_conf": 0.85,
+    "count_mae": 3.443,
+    "count_bias": -1.854,
+    "count_r": 0.7485,
+    "mae_conf": 0.9,
+    "total_pred": 1609,
+    "total_gt": 2195
+  }
+}
